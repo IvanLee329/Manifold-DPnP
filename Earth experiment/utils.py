@@ -1,0 +1,621 @@
+import torch
+import numpy as np
+import math
+DEFAULT_DTYPE = torch.float32
+EPS64 = 1e-12
+EPS32 = 1e-7
+sig2 = 0.1
+
+def get_eps(dtype):
+    return EPS32 if dtype == torch.float32 else EPS64
+
+def get_best_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+# ============================================================
+# S^2 geometry utilities
+# ============================================================
+
+def normalize_torch(x: torch.Tensor, eps: float = 1e-12):
+    """
+    Normalize vectors along the last dimension.
+
+    Supports shapes:
+        (d,)
+        (N,d)
+        (B,P,d)
+        (...,d)
+    """
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+def tangent_project_torch(x: torch.Tensor, v: torch.Tensor):
+    """
+    Project v onto the tangent space at x on S^{d-1}.
+
+    Both tensors must have shape (..., d).
+
+    Returns tensor of shape (..., d).
+    """
+    dot = (x * v).sum(dim=-1, keepdim=True)
+    return v - dot * x
+
+def sphere_exp_map_torch(x: torch.Tensor, v: torch.Tensor, eps: float = 1e-12):
+    """
+    Exponential map on the unit sphere.
+
+    x : (..., d) point on S^{d-1}
+    v : (..., d) tangent vector
+
+    Returns:
+        (..., d)
+    """
+    v_norm = v.norm(dim=-1, keepdim=True)
+
+    # safe normalized direction
+    v_dir = v / v_norm.clamp_min(eps)
+
+    cos = torch.cos(v_norm)
+    sin = torch.sin(v_norm)
+
+    y = cos * x + sin * v_dir
+
+    return normalize_torch(y, eps)
+
+def sphere_distance_torch(x, y, euclidean=True, eps=None):
+    if eps is None:
+        eps = get_eps(x.dtype)
+
+    x = normalize_torch(x, eps=eps)
+    y = normalize_torch(y, eps=eps)
+
+    dot = torch.sum(x * y, dim=-1).clamp(-1.0, 1.0)
+
+    if euclidean:
+        return torch.sqrt(torch.clamp(2.0 * (1.0 - dot), min=0.0))
+    else:
+        sin_theta = torch.linalg.norm(x - dot.unsqueeze(-1) * y, dim=-1)
+        return torch.atan2(sin_theta, dot)
+
+
+def parallel_transport_S2_torch(x, y, V, eps=None):
+    if eps is None:
+        eps = get_eps(x.dtype)
+
+    x = normalize_torch(x, eps=eps)
+    y = normalize_torch(y, eps=eps)
+
+    dot = torch.sum(x * y, dim=-1, keepdim=True)
+    denom = torch.clamp(1.0 + dot, min=eps)
+
+    yTV = torch.sum(y.unsqueeze(-1) * V, dim=-2, keepdim=True)
+    corr = (yTV / denom.unsqueeze(-1)) * (x + y).unsqueeze(-1)
+    W = V - corr
+
+    W = W - torch.sum(y.unsqueeze(-1) * W, dim=-2, keepdim=True) * y.unsqueeze(-1)
+    return W
+
+
+def orthonormalize_frames_torch(U, eps=None):
+    if eps is None:
+        eps = get_eps(U.dtype)
+
+    v0 = U[..., :, 0]
+    n0 = torch.linalg.norm(v0, dim=-1, keepdim=True)
+    q0 = v0 / torch.clamp(n0, min=eps)
+
+    v1 = U[..., :, 1]
+    proj = torch.sum(q0 * v1, dim=-1, keepdim=True)
+    v1 = v1 - proj * q0
+    n1 = torch.linalg.norm(v1, dim=-1, keepdim=True)
+    q1 = v1 / torch.clamp(n1, min=eps)
+
+    return torch.stack([q0, q1], dim=-1)
+
+
+def make_tangent_frame_S2_batch_torch(X, eps=None):
+    if eps is None:
+        eps = get_eps(X.dtype)
+
+    X = normalize_torch(X, eps=eps)
+
+    use_x = torch.abs(X[..., 0]) < 0.9
+    A_x = torch.tensor([1.0, 0.0, 0.0], dtype=X.dtype, device=X.device)
+    A_y = torch.tensor([0.0, 1.0, 0.0], dtype=X.dtype, device=X.device)
+    A = torch.where(use_x.unsqueeze(-1), A_x, A_y)
+
+    e1 = tangent_project_torch(X, A)
+    e1 = normalize_torch(e1, eps=eps)
+
+    e2 = torch.cross(X, e1, dim=-1)
+    e2 = normalize_torch(e2, eps=eps)
+
+    return torch.stack([e1, e2], dim=-1)
+####################### VMF sampler #######################
+def tangent_basis_s2(mu: torch.Tensor, eps: float = 1e-12):
+    """
+    Build an orthonormal tangent basis at each mu on S^2.
+
+    Parameters
+    ----------
+    mu : (..., 3) tensor
+
+    Returns
+    -------
+    e1, e2 : (..., 3) tensors
+        Orthonormal basis vectors spanning T_mu S^2.
+    """
+    if mu.shape[-1] != 3:
+        raise ValueError("mu must have shape (..., 3)")
+
+    mu = normalize_torch(mu, eps=eps)
+
+    ref_x = torch.tensor([1.0, 0.0, 0.0], device=mu.device, dtype=mu.dtype)
+    ref_y = torch.tensor([0.0, 1.0, 0.0], device=mu.device, dtype=mu.dtype)
+
+    # If mu is too aligned with x-axis, use y-axis instead
+    use_y = (mu[..., 0].abs() > 0.9)[..., None]
+    ref = torch.where(use_y, ref_y.expand_as(mu), ref_x.expand_as(mu))
+
+    e1 = ref - (ref * mu).sum(dim=-1, keepdim=True) * mu
+    e1 = normalize_torch(e1, eps=eps)
+
+    e2 = torch.cross(mu, e1, dim=-1)
+    e2 = normalize_torch(e2, eps=eps)
+
+    return e1, e2
+
+
+def _prepare_kappa(kappa, target_shape, device, dtype):
+    """
+    Convert kappa to tensor broadcastable to target_shape.
+    target_shape is the leading shape, i.e. mu.shape[:-1].
+    """
+    if not torch.is_tensor(kappa):
+        kappa = torch.tensor(kappa, device=device, dtype=dtype)
+    else:
+        kappa = kappa.to(device=device, dtype=dtype)
+
+    try:
+        kappa = torch.broadcast_to(kappa, target_shape)
+    except RuntimeError as e:
+        raise ValueError(
+            f"kappa with shape {tuple(kappa.shape)} is not broadcastable "
+            f"to target leading shape {tuple(target_shape)}"
+        ) from e
+    return kappa
+
+
+@torch.no_grad()
+def sample_vmf_s2(
+    mu: torch.Tensor,
+    kappa,
+    n_samples: int | None = None,
+    generator=None,
+    eps: float = 1e-12,
+    keep_sample_dim: bool = False,
+) -> torch.Tensor:
+    """
+    Sample from the von Mises-Fisher distribution on S^2:
+        p(x | mu, kappa) ∝ exp(kappa * <mu, x>)
+
+    Supports mu with shape:
+        (3,)
+        (N, 3)
+        (B, P, 3)
+        (..., 3)
+
+    Parameters
+    ----------
+    mu : (..., 3) tensor
+        Mean direction(s) on S^2.
+    kappa : scalar or tensor broadcastable to mu.shape[:-1]
+        Concentration parameter(s).
+    n_samples : int or None
+        Number of samples per mu.
+        If None, returns one sample per mu with output shape (..., 3).
+        If integer m, returns shape (..., m, 3), unless
+        m == 1 and keep_sample_dim=False, in which case returns (..., 3).
+    generator : torch.Generator, optional
+    eps : float
+    keep_sample_dim : bool
+        Whether to keep the sample dimension when n_samples == 1.
+
+    Returns
+    -------
+    x : tensor
+        Shape (..., 3) or (..., n_samples, 3).
+    """
+    if mu.shape[-1] != 3:
+        raise ValueError("mu must have shape (..., 3)")
+
+    mu = normalize_torch(mu, eps=eps)
+    device, dtype = mu.device, mu.dtype
+    lead_shape = mu.shape[:-1]
+
+    if n_samples is None:
+        n_samples = 1
+        squeeze_output = True and (not keep_sample_dim)
+    else:
+        if n_samples < 1:
+            raise ValueError("n_samples must be >= 1")
+        squeeze_output = (n_samples == 1) and (not keep_sample_dim)
+
+    kappa = _prepare_kappa(kappa, lead_shape, device, dtype)
+
+    # Shapes:
+    #   mu         : (..., 3)
+    #   e1, e2     : (..., 3)
+    #   phi, u, w  : (..., n_samples)
+    #   x          : (..., n_samples, 3)
+
+    phi = 2.0 * math.pi * torch.rand(
+        *lead_shape, n_samples, device=device, dtype=dtype, generator=generator
+    )
+    u = torch.rand(
+        *lead_shape, n_samples, device=device, dtype=dtype, generator=generator
+    )
+
+    kappa_exp = kappa[..., None]  # (..., 1)
+    small = torch.abs(kappa_exp) < 1e-8
+
+    # For kappa = 0, uniform on sphere
+    w_uniform = 2.0 * u - 1.0
+
+    # Inverse CDF for vMF on S^2:
+    #   F(w) = (exp(kappa w) - exp(-kappa)) / (exp(kappa) - exp(-kappa))
+    # so
+    #   w = -1 + log(1 + u * (exp(2kappa)-1)) / kappa
+    w_vmf = -1.0 + torch.log1p(u * torch.expm1(2.0 * kappa_exp)) / kappa_exp
+
+    w = torch.where(small, w_uniform, w_vmf).clamp(-1.0, 1.0)
+    sin_theta = torch.sqrt((1.0 - w**2).clamp_min(0.0))
+
+    e1, e2 = tangent_basis_s2(mu, eps=eps)  # (..., 3)
+
+    tangent_dir = (
+        torch.cos(phi)[..., None] * e1[..., None, :]
+        + torch.sin(phi)[..., None] * e2[..., None, :]
+    )  # (..., n_samples, 3)
+
+    x = w[..., None] * mu[..., None, :] + sin_theta[..., None] * tangent_dir
+    x = normalize_torch(x, eps=eps)
+
+    if squeeze_output:
+        x = x.squeeze(-2)
+
+    return x
+
+
+####################################################################
+@torch.no_grad()
+def sample_geodesic_gaussian_on_sphere(
+    x: torch.Tensor,
+    sigma=None,
+    generator=None,
+) -> torch.Tensor:
+    """
+    Sample y ~ exp_x(N(0, sigma)) on S^2.
+
+    Supports x with shape:
+        (3,)
+        (N,3)
+        (B,P,3)
+        (...,3)
+
+    sigma options:
+        None          -> 0.05 * I_3
+        scalar        -> isotropic variance
+        (3,3)         -> covariance matrix
+        (...,3,3)     -> batched covariance
+    """
+
+    x = normalize_torch(x)
+
+    d = x.shape[-1]
+    batch_shape = x.shape[:-1]
+
+    # default covariance
+    if sigma is None:
+        sigma = sig2 * torch.eye(d, device=x.device, dtype=x.dtype)
+    else:
+        sigma = torch.as_tensor(sigma, device=x.device, dtype=x.dtype)
+
+    # ambient Gaussian noise
+    z = torch.randn(
+        *batch_shape, d,
+        device=x.device,
+        dtype=x.dtype,
+        generator=generator,
+    )
+
+    v = tangent_project_torch(x, z)
+
+    # apply covariance
+    if sigma.ndim == 0:
+        v = sigma * v
+    elif sigma.ndim == 2:
+        v = torch.matmul(v, sigma.T)
+    else:
+        v = torch.matmul(v.unsqueeze(-2), sigma).squeeze(-2)
+
+    y = sphere_exp_map_torch(x, v)
+
+    return normalize_torch(y)
+
+# ============================================================
+# Default f_fn examples
+# ============================================================
+
+def gaussian_kernel_f(X, y, sig2=sig2, euclidean=False):
+    """
+    X: (B,P,3)
+    y: (3,) or broadcastable to (B,P,3)
+    returns: (B,P)
+    """
+    dist = sphere_distance_torch(X, y, euclidean=euclidean)
+    return torch.exp((-1 / (2 * sig2)) * dist * dist)
+
+def get_gaussian_kernel_f(sig2):
+    def f(X,y):
+        return gaussian_kernel_f(X,y, sig2=sig2, euclidean = False)
+    return f
+
+def vmf_s2_unnormalized_pdf(
+    x: torch.Tensor,
+    mu: torch.Tensor,
+    kappa,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Unnormalized vMF density on S^2:
+        f(x) = exp(kappa * <mu, x>)
+    """
+    if x.shape[-1] != 3 or mu.shape[-1] != 3:
+        raise ValueError("x and mu must both have shape (..., 3)")
+
+    x = normalize_torch(x, eps=eps)
+    mu = normalize_torch(mu, eps=eps)
+
+    dot = (x * mu).sum(dim=-1)
+
+    if not torch.is_tensor(kappa):
+        kappa = torch.tensor(kappa, device=dot.device, dtype=dot.dtype)
+    else:
+        kappa = kappa.to(device=dot.device, dtype=dot.dtype)
+
+    return torch.exp(kappa * dot)
+
+
+def get_vmf_f(kappa):
+    def f(x,y):
+        return vmf_s2_unnormalized_pdf(x=y,mu=x,kappa=kappa)
+    return f
+
+
+# =========================================================
+# Geometry helpers on S^2
+# =========================================================
+def extrinsic_to_latlon_deg_torch(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    x = normalize_torch(x, eps)
+    xx, yy, zz = x[..., 0], x[..., 1], x[..., 2]
+    lat = torch.rad2deg(torch.arcsin(zz.clamp(-1.0, 1.0)))
+    lon = torch.rad2deg(torch.atan2(yy, xx))
+    return torch.stack([lat, lon], dim=-1)
+
+
+def wrap_longitude_relative(lon_deg: np.ndarray, center_deg: float) -> np.ndarray:
+    return ((lon_deg - center_deg + 180.0) % 360.0) - 180.0 + center_deg
+
+
+def great_circle_interp_torch(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    n_points: int = 80,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    Spherical linear interpolation between two points on S^2.
+    a, b: (3,)
+    returns: (n_points, 3)
+    """
+    a = normalize_torch(a, eps)
+    b = normalize_torch(b, eps)
+
+    dot = (a * b).sum().clamp(-1.0, 1.0)
+    omega = torch.arccos(dot)
+
+    if omega.abs() < 1e-8:
+        return a[None, :].repeat(n_points, 1)
+
+    t = torch.linspace(0.0, 1.0, n_points, device=a.device, dtype=a.dtype)
+    so = torch.sin(omega)
+    pts = (
+        torch.sin((1 - t) * omega)[:, None] / so * a[None, :]
+        + torch.sin(t * omega)[:, None] / so * b[None, :]
+    )
+    return normalize_torch(pts, eps)
+
+
+def sphere_mean_torch(x: torch.Tensor, dim: int = -2, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Extrinsic mean projected back to S^2.
+    x: (..., P, 3)
+    """
+    return normalize_torch(x.mean(dim=dim), eps)
+
+
+def extrinsic_to_latlon_rad_torch(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    x: (..., 3) on S^2
+    returns (..., 2) = [lat_rad, lon_rad]
+    """
+    x = normalize_torch(x, eps)
+    xx, yy, zz = x[..., 0], x[..., 1], x[..., 2]
+    lat = torch.arcsin(zz.clamp(-1.0, 1.0))
+    lon = torch.atan2(yy, xx)
+    return torch.stack([lat, lon], dim=-1)
+
+
+def spherical_kde_vmf(
+    samples: torch.Tensor,
+    eval_points: torch.Tensor,
+    kappa: float = 25.0,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    von Mises-Fisher kernel density estimate on S^2.
+
+    samples     : (N,3)
+    eval_points : (M,3)
+    returns     : (M,)
+
+    Kernel:
+        K_kappa(z, x) ~ exp(kappa * <z, x>)
+
+    If normalize=True, includes the S^2 vMF normalizing constant:
+        c(kappa) = kappa / (4*pi*sinh(kappa))
+    """
+    samples = normalize_torch(samples)
+    eval_points = normalize_torch(eval_points)
+
+    dots = eval_points @ samples.T   # (M,N)
+    vals = torch.exp(kappa * dots)
+
+    if normalize:
+        c_kappa = kappa / (4.0 * np.pi * np.sinh(kappa))
+        vals = c_kappa * vals
+
+    return vals.mean(dim=1)
+
+# =========================================================
+# Data sampling helper
+# =========================================================
+
+@torch.no_grad()
+def sample_xtrue_y_batches_from_dataloader(
+    dataloader,
+    sigma_y: float,
+    num_pairs: int,
+    device="mps",
+    dtype=torch.float32,
+    seed: int = 0,
+):
+    """
+    Uniformly sample num_pairs x_true from the dataset underlying the dataloader.
+    Correctly handles torch.utils.data.Subset, so if dataloader is test_loader,
+    sampling is restricted to the test split.
+
+    Then sample y | x_true from vmf
+    """
+    device = torch.device(device)
+
+    # CPU generator for index sampling
+    gen_cpu = torch.Generator(device="cpu")
+    gen_cpu.manual_seed(int(seed))
+
+    ds = dataloader.dataset
+
+    if hasattr(ds, "dataset") and hasattr(ds, "indices"):
+        base_dataset = ds.dataset
+        subset_indices = torch.as_tensor(ds.indices, dtype=torch.long)  # stays on CPU
+        N = subset_indices.shape[0]
+
+        if num_pairs > N:
+            raise ValueError(f"num_pairs={num_pairs} exceeds subset size {N}")
+
+        chosen_subset_pos = torch.randperm(N, generator=gen_cpu)[:num_pairs]
+        chosen_base_idx = subset_indices[chosen_subset_pos].tolist()
+
+        xs = []
+        for idx in chosen_base_idx:
+            item = base_dataset[idx]
+            x = item[0] if isinstance(item, (tuple, list)) else item
+            x = torch.as_tensor(x, device=device, dtype=dtype)
+            xs.append(x)
+
+        x_true_all = normalize_torch(torch.stack(xs, dim=0))
+
+    else:
+        N = len(ds)
+
+        if num_pairs > N:
+            raise ValueError(f"num_pairs={num_pairs} exceeds dataset size {N}")
+
+        chosen_idx = torch.randperm(N, generator=gen_cpu)[:num_pairs].tolist()
+
+        xs = []
+        for idx in chosen_idx:
+            item = ds[idx]
+            x = item[0] if isinstance(item, (tuple, list)) else item
+            x = torch.as_tensor(x, device=device, dtype=dtype)
+            xs.append(x)
+
+        x_true_all = normalize_torch(torch.stack(xs, dim=0))
+
+    # Separate generator for sphere sampling on target device
+    gen_device = torch.Generator(device=device)
+    gen_device.manual_seed(int(seed) + 1)
+
+    y_all = sample_vmf_s2(
+        mu=x_true_all,
+        kappa=sigma_y,
+        generator=gen_device,
+    )
+    y_all = normalize_torch(y_all)
+
+    return x_true_all, y_all
+
+# =========================================================
+# Plotting-coordinate helpers
+# =========================================================
+
+def extrinsic_to_mollweide_rad_torch(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """
+    Convert extrinsic S^2 points to plotting coordinates for matplotlib Mollweide.
+
+    Returns (..., 2) = [plot_lat_rad, plot_lon_rad]
+    where plot_lat_rad includes the sign flip needed for this dataset.
+    """
+    ll = extrinsic_to_latlon_rad_torch(x, eps=eps)
+    out = ll.clone()
+    out[..., 0] = -out[..., 0]   # flip latitude for plotting only
+    return out
+
+
+def mollweide_plot_grid_xyz_torch(
+    n_lon: int = 240,
+    n_lat: int = 120,
+    device=None,
+    dtype=torch.float32,
+):
+    """
+    Build a Mollweide plotting grid and the corresponding physical S^2 points.
+
+    Returns
+    -------
+    Lon_plot : (n_lon, n_lat)
+    Lat_plot : (n_lon, n_lat)
+    grid_xyz : (n_lon*n_lat, 3)
+
+    Important:
+    plot_lat = - physical_lat
+    so the physical z-coordinate is z = sin(physical_lat) = -sin(plot_lat).
+    """
+    lon = torch.linspace(-np.pi, np.pi, n_lon, device=device, dtype=dtype)
+    lat_plot = torch.linspace(-0.5 * np.pi, 0.5 * np.pi, n_lat, device=device, dtype=dtype)
+
+    Lon_plot, Lat_plot = torch.meshgrid(lon, lat_plot, indexing="xy")
+
+    xg = torch.cos(Lat_plot) * torch.cos(Lon_plot)
+    yg = torch.cos(Lat_plot) * torch.sin(Lon_plot)
+    zg = -torch.sin(Lat_plot)
+
+    grid_xyz = torch.stack([xg, yg, zg], dim=-1).reshape(-1, 3)
+    return Lon_plot, Lat_plot, grid_xyz
+
+
+
