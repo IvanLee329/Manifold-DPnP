@@ -13,6 +13,7 @@ except Exception:
 
 
 from DPnP import dPnP_sampler_torch_batched
+from bel import get_bel
 from utils import (
     normalize_torch,
     sample_geodesic_gaussian_on_sphere,
@@ -23,7 +24,10 @@ from utils import (
     extrinsic_to_latlon_rad_torch,
     extrinsic_to_mollweide_rad_torch,
     mollweide_plot_grid_xyz_torch,
-    sample_vmf_s2
+    sample_vmf_s2,
+    seismic_signal,
+    get_seismic_f_fn,
+    get_two_point_seismic_f_fn,
 )
 
 
@@ -1149,3 +1153,430 @@ def replot_dpnp_results_for_xtrue(
         ),
         levels=levels,
     )
+
+
+# =========================================================
+# Two-point seismic inverse problem – cosine vs steps
+# =========================================================
+
+@torch.no_grad()
+def cosine_similarity_vs_steps_two_point(
+    dataloader,
+    p_score,
+    eta,
+    y1,
+    y2,
+    beta: float,
+    sigma2: float,
+    n_bel_paths: int = 5000,
+    n_bel_steps: int = 5,
+    particle_counts=(1, 5, 10, 20),
+    out_samples: int = 64,
+    grw_steps: int = 5,
+    num_pairs: int = 64,
+    batch_eval_size: int = 8,
+    device="mps",
+    dtype=torch.float32,
+    seed: int = 0,
+    show_stderr: bool = True,
+):
+    """
+    Two-point seismic analog of cosine_similarity_vs_steps_for_particle_counts.
+
+    For each x_true sampled from the dataloader, draws scalar observations
+    (u1, u2) from the seismic model with fixed sensor locations y1, y2:
+
+        I(x, y) = exp(beta * (<x, y> - 1))
+        u1 ~ N(I(x_true, y1), sigma2),  u2 ~ N(I(x_true, y2), sigma2)
+
+    Then runs DPnP with the joint two-sensor likelihood as q_score and records
+    the mean cosine similarity at every DPnP step for each particle count N.
+
+    Parameters
+    ----------
+    dataloader : DataLoader  -- source of x_true samples (earthquake data etc.)
+    p_score    : callable    -- trained prior score p_score(x, t)
+    eta        : 1-D array   -- DPnP time schedule
+    y1, y2     : (3,)        -- sensor locations on S^2
+    beta       : float       -- seismic signal decay rate
+    sigma2     : float       -- observation noise variance
+    n_bel_paths, n_bel_steps : BEL hyper-parameters
+    particle_counts          : N values to evaluate
+    out_samples              : total particles per DPnP call (>= max(particle_counts))
+    grw_steps                : SDE integration steps per DPnP step
+    num_pairs                : number of (x_true, u1, u2) triples to average over
+    batch_eval_size          : how many triples to batch into one DPnP call
+    seed                     : random seed
+
+    Returns
+    -------
+    dict with keys:
+        "steps", "by_particle_count": {N: {"mean_cos", "stderr_cos"}}
+    """
+    device = torch.device(device)
+
+    particle_counts = sorted(set(int(n) for n in particle_counts))
+    if min(particle_counts) < 1:
+        raise ValueError("all particle_counts must be >= 1")
+    if max(particle_counts) > out_samples:
+        raise ValueError(
+            f"max particle count {max(particle_counts)} > out_samples {out_samples}"
+        )
+
+    y1 = normalize_torch(torch.as_tensor(y1, device=device, dtype=dtype))
+    y2 = normalize_torch(torch.as_tensor(y2, device=device, dtype=dtype))
+    sigma = math.sqrt(sigma2)
+
+    # Sample x_true; ignore the vMF y returned by helper
+    x_true_all, _ = sample_xtrue_y_batches_from_dataloader(
+        dataloader=dataloader,
+        sigma_y=1.0,          # sigma_y value is irrelevant; y is discarded
+        num_pairs=num_pairs,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+    )
+
+    cos_chunks_by_N = {N: [] for N in particle_counts}
+    running_seed = seed
+
+    for start in range(0, num_pairs, batch_eval_size):
+        end = min(start + batch_eval_size, num_pairs)
+        x_batch = x_true_all[start:end]          # (B, 3)
+        B = x_batch.shape[0]
+
+        # Compute true seismic signals for this mini-batch
+        I1_true = seismic_signal(x_batch, y1, beta)   # (B,)
+        I2_true = seismic_signal(x_batch, y2, beta)   # (B,)
+
+        # Sample observations
+        gen = torch.Generator(device=device)
+        gen.manual_seed(running_seed)
+        u1_batch = I1_true + sigma * torch.randn(B, device=device, dtype=dtype, generator=gen)
+        u2_batch = I2_true + sigma * torch.randn(B, device=device, dtype=dtype, generator=gen)
+
+        # Batched two-point f_fn: handles all B triples in one DPnP call
+        f_fn = get_two_point_seismic_f_fn(y1, y2, u1_batch, u2_batch, beta, sigma2)
+        q_score = get_bel(
+            f_fn=f_fn,
+            n_paths=n_bel_paths,
+            n_steps=n_bel_steps,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Dummy y of shape (B, 3) to set the DPnP batch dimension
+        dummy_y = y1.unsqueeze(0).expand(B, 3)
+
+        X_steps = dPnP_sampler_torch_batched(
+            q_score=q_score,
+            p_score=p_score,
+            y=dummy_y,
+            out_samples=out_samples,
+            eta=eta,
+            grw_steps=grw_steps,
+            seed=running_seed,
+            end_only=False,
+            device=device,
+            dtype=dtype,
+        )   # (S+1, B, P, 3)
+        running_seed += 1
+
+        S_plus_1, _B, _P, _d = X_steps.shape
+
+        for N in particle_counts:
+            X_sub = X_steps[:, :, :N, :]                      # (S+1, B, N, 3)
+            X_sub_mean = sphere_mean_torch(X_sub, dim=2)       # (S+1, B, 3)
+            cos = (X_sub_mean * x_batch[None, :, :]).sum(-1)  # (S+1, B)
+            cos_chunks_by_N[N].append(cos.cpu())
+
+    all_cos_by_N = {
+        N: torch.cat(cos_chunks_by_N[N], dim=1)   # (S+1, num_pairs)
+        for N in particle_counts
+    }
+    mean_cos_by_N = {N: all_cos_by_N[N].mean(dim=1).numpy() for N in particle_counts}
+    stderr_cos_by_N = {
+        N: (all_cos_by_N[N].std(dim=1, unbiased=False).numpy()
+            / np.sqrt(all_cos_by_N[N].shape[1]))
+        for N in particle_counts
+    }
+
+    steps = np.arange(S_plus_1)
+
+    # ---- summary print ----
+    for N in particle_counts:
+        final = mean_cos_by_N[N][-1]
+        print(f"N = {N:>3d} | final step mean cos = {final:.6f}")
+
+    # ---- plot ----
+    ymin = min(float(v.min()) for v in mean_cos_by_N.values())
+    ymax = max(float(v.max()) for v in mean_cos_by_N.values())
+    pad = 0.05 * max(1e-8, ymax - ymin)
+
+    plt.figure(figsize=(8, 5))
+    for N in particle_counts:
+        plt.plot(steps, mean_cos_by_N[N], marker="o", linewidth=2, label=f"N = {N}")
+        if show_stderr:
+            plt.fill_between(
+                steps,
+                mean_cos_by_N[N] - stderr_cos_by_N[N],
+                mean_cos_by_N[N] + stderr_cos_by_N[N],
+                alpha=0.12,
+            )
+
+    plt.xlabel("DPnP step")
+    plt.ylabel("mean cosine similarity")
+    plt.title(
+        "Two-point seismic: cosine similarity vs DPnP step\n"
+        "spherical mean reconstruction using N particles"
+    )
+    plt.ylim(ymin - pad, ymax + pad)
+    plt.grid(alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "steps": steps,
+        "by_particle_count": {
+            N: {"mean_cos": mean_cos_by_N[N], "stderr_cos": stderr_cos_by_N[N]}
+            for N in particle_counts
+        },
+    }
+
+
+# =========================================================
+# Two-point seismic demo – single x_true, multiple u samples
+# =========================================================
+
+@torch.no_grad()
+def run_two_point_earthquake_demo(
+    x_true,
+    y1,
+    y2,
+    beta: float,
+    sigma2: float,
+    p_score,
+    eta,
+    n_trials: int = 20,
+    n_bel_paths: int = 5000,
+    n_bel_steps: int = 5,
+    out_samples: int = 32,
+    grw_steps: int = 5,
+    particle_counts=(1, 5, 10, 20),
+    kde_kappa: float = 25.0,
+    device="mps",
+    dtype=torch.float32,
+    seed: int = 0,
+    show_stderr: bool = True,
+):
+    """
+    Two-point seismic earthquake reconstruction demo.
+
+    Given a known earthquake location x_true and two fixed sensor positions
+    y1, y2, repeatedly samples scalar measurements
+
+        u1_k ~ N(I(x_true, y1), sigma2)
+        u2_k ~ N(I(x_true, y2), sigma2)
+        I(x, y) = exp(beta * (<x, y> - 1))
+
+    for k = 1 … n_trials and runs DPnP with the joint two-sensor likelihood as
+    q_score to reconstruct x from the pair (u1_k, y1), (u2_k, y2).
+
+    Displays:
+      1. Mollweide KDE of all per-trial averaged reconstructions.
+      2. Cosine similarity vs DPnP step for different particle counts N.
+
+    Parameters
+    ----------
+    x_true : (3,) tensor  -- true earthquake location on S^2
+    y1, y2 : (3,) tensors -- sensor locations on S^2
+    beta   : float        -- seismic signal decay rate (beta > 0)
+    sigma2 : float        -- observation noise variance
+    p_score : callable    -- trained prior score p_score(x, t)
+    eta     : 1-D array   -- DPnP time schedule (length = number of outer steps)
+    n_trials : int        -- K, number of (u1, u2) realisations to average
+    n_bel_paths, n_bel_steps : BEL hyper-parameters
+    out_samples           : DPnP particles P per trial
+    grw_steps             : SDE integration steps per DPnP step
+    particle_counts       : N values for the cosine-vs-step plot
+    kde_kappa             : vMF bandwidth for the Mollweide KDE
+    seed                  : base random seed
+
+    Returns
+    -------
+    dict with keys:
+        x_true, y1, y2,
+        u1_all (K,), u2_all (K,),
+        X_finals (K, P, 3)  -- final DPnP particles per trial
+        trial_means (K, 3)  -- per-trial spherical mean reconstruction
+        overall_mean (3,)   -- spherical mean over all trial means
+        cos_x_trials (K,)   -- cosine <trial_mean_k, x_true>
+        cos_steps_by_N      -- {N: (S+1, K) array}
+    """
+    device = torch.device(device)
+    eta_t = torch.as_tensor(eta, device=device, dtype=dtype)
+    S = int(eta_t.numel())
+
+    x_true = normalize_torch(torch.as_tensor(x_true, device=device, dtype=dtype))
+    y1 = normalize_torch(torch.as_tensor(y1, device=device, dtype=dtype))
+    y2 = normalize_torch(torch.as_tensor(y2, device=device, dtype=dtype))
+
+    particle_counts = sorted(set(int(n) for n in particle_counts))
+    if max(particle_counts) > out_samples:
+        raise ValueError(
+            f"max particle count {max(particle_counts)} > out_samples {out_samples}"
+        )
+
+    sigma = math.sqrt(sigma2)
+
+    # ---- 1. Compute true signals ----
+    I1_true = seismic_signal(x_true, y1, beta).item()
+    I2_true = seismic_signal(x_true, y2, beta).item()
+    print(f"True signals:  I(x, y1) = {I1_true:.4f},  I(x, y2) = {I2_true:.4f}")
+
+    # ---- 2. Sample K observations ----
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    u1_all = I1_true + sigma * torch.randn(n_trials, device=device, dtype=dtype, generator=gen)
+    u2_all = I2_true + sigma * torch.randn(n_trials, device=device, dtype=dtype, generator=gen)
+    print(f"Sampled {n_trials} (u1, u2) pairs. "
+          f"u1 mean={u1_all.mean():.4f}, u2 mean={u2_all.mean():.4f}")
+
+    # ---- 3. Run DPnP for all K trials in one batched call ----
+    f_fn = get_two_point_seismic_f_fn(y1, y2, u1_all, u2_all, beta, sigma2)
+    q_score = get_bel(
+        f_fn=f_fn,
+        n_paths=n_bel_paths,
+        n_steps=n_bel_steps,
+        device=device,
+        dtype=dtype,
+    )
+
+    dummy_y = y1.unsqueeze(0).expand(n_trials, 3)   # (K, 3) – sets B = K
+
+    X_steps = dPnP_sampler_torch_batched(
+        q_score=q_score,
+        p_score=p_score,
+        y=dummy_y,
+        out_samples=out_samples,
+        eta=eta_t,
+        grw_steps=grw_steps,
+        seed=seed,
+        end_only=False,
+        device=device,
+        dtype=dtype,
+    )   # (S+1, K, P, 3)
+
+    X_finals = X_steps[-1]          # (K, P, 3)
+    trial_means = sphere_mean_torch(X_finals, dim=1)          # (K, 3)
+    overall_mean = sphere_mean_torch(trial_means, dim=0)      # (3,)
+
+    # ---- 4. Cosine similarities ----
+    cos_trials = (trial_means * x_true).sum(-1)               # (K,)
+    print(f"Reconstruction cosine: mean={cos_trials.mean():.4f}  "
+          f"std={cos_trials.std():.4f}")
+    print(f"Overall mean cosine: {(overall_mean * x_true).sum():.4f}")
+
+    # ---- 5. Per-step cosine for each N and trial ----
+    cos_steps_by_N = {}
+    for N in particle_counts:
+        X_sub = X_steps[:, :, :N, :]                                  # (S+1, K, N, 3)
+        X_sub_mean = sphere_mean_torch(X_sub, dim=2)                  # (S+1, K, 3)
+        cos_steps_by_N[N] = (X_sub_mean * x_true[None, None, :]).sum(-1).cpu()  # (S+1, K)
+
+    # ---- 6. Plot: Mollweide KDE of trial-mean reconstructions ----
+    Lon, Lat, grid_xyz = mollweide_plot_grid_xyz_torch(
+        n_lon=240, n_lat=120, device=trial_means.device, dtype=dtype
+    )
+    dens = spherical_kde_vmf(trial_means, grid_xyz, kappa=kde_kappa, normalize=True)
+    dens_np = dens.reshape(Lon.shape).cpu().numpy()
+
+    fig, ax = plt.subplots(1, 1, figsize=(11, 5.5),
+                           subplot_kw={"projection": "mollweide"})
+    cf = ax.contourf(Lon.cpu().numpy(), Lat.cpu().numpy(), dens_np, levels=20, cmap="viridis")
+    fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
+
+    # per-trial means
+    ll_tm = extrinsic_to_mollweide_rad_torch(trial_means.cpu()).numpy()
+    ax.scatter(ll_tm[:, 1], ll_tm[:, 0], s=18, color="white", alpha=0.65,
+               edgecolors="none", zorder=5, label="trial means")
+
+    # overall mean
+    ll_om = extrinsic_to_mollweide_rad_torch(overall_mean.cpu()[None]).numpy()[0]
+    ax.scatter([ll_om[1]], [ll_om[0]], s=120, color="gold", marker="*",
+               edgecolors="black", linewidths=1.2, zorder=8, label="overall mean")
+
+    # x_true
+    ll_x = extrinsic_to_mollweide_rad_torch(x_true.cpu()[None]).numpy()[0]
+    ax.scatter([ll_x[1]], [ll_x[0]], s=90, color="tab:red",
+               edgecolors="black", linewidths=1.2, zorder=9, label=r"$x_{\rm true}$")
+
+    # sensors
+    for yi, label, color in [(y1, r"$y_1$", "tab:cyan"), (y2, r"$y_2$", "tab:orange")]:
+        ll_yi = extrinsic_to_mollweide_rad_torch(yi.cpu()[None]).numpy()[0]
+        ax.scatter([ll_yi[1]], [ll_yi[0]], s=80, color=color, marker="D",
+                   edgecolors="black", linewidths=1.0, zorder=7, label=label)
+
+    ax.grid(True, alpha=0.28)
+    ax.set_xticklabels(
+        ["150°W","120°W","90°W","60°W","30°W","0°","30°E","60°E","90°E","120°E","150°E"]
+    )
+    ax.set_title(
+        f"Two-point seismic reconstruction (n_trials={n_trials}, "
+        f"beta={beta}, sigma2={sigma2})\n"
+        f"averaged over {n_trials} independent (u1, u2) samples"
+    )
+    ax.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+    # ---- 7. Plot: cosine similarity vs DPnP steps ----
+    steps_arr = np.arange(S + 1)
+    mean_cos_by_N = {N: cos_steps_by_N[N].mean(dim=1).numpy() for N in particle_counts}
+    stderr_cos_by_N = {
+        N: (cos_steps_by_N[N].std(dim=1, unbiased=False).numpy()
+            / np.sqrt(n_trials))
+        for N in particle_counts
+    }
+
+    ymin = min(float(v.min()) for v in mean_cos_by_N.values())
+    ymax = max(float(v.max()) for v in mean_cos_by_N.values())
+    pad = 0.05 * max(1e-8, ymax - ymin)
+
+    plt.figure(figsize=(8, 5))
+    for N in particle_counts:
+        plt.plot(steps_arr, mean_cos_by_N[N], marker="o", linewidth=2, label=f"N = {N}")
+        if show_stderr:
+            plt.fill_between(
+                steps_arr,
+                mean_cos_by_N[N] - stderr_cos_by_N[N],
+                mean_cos_by_N[N] + stderr_cos_by_N[N],
+                alpha=0.12,
+            )
+
+    plt.xlabel("DPnP step")
+    plt.ylabel("mean cosine similarity")
+    plt.title(
+        f"Two-point seismic: cosine similarity vs DPnP step\n"
+        f"averaged over {n_trials} (u1, u2) realisations, "
+        f"beta={beta}, sigma2={sigma2}"
+    )
+    plt.ylim(ymin - pad, ymax + pad)
+    plt.grid(alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "x_true": x_true.cpu(),
+        "y1": y1.cpu(),
+        "y2": y2.cpu(),
+        "u1_all": u1_all.cpu(),
+        "u2_all": u2_all.cpu(),
+        "X_finals": X_finals.cpu(),
+        "trial_means": trial_means.cpu(),
+        "overall_mean": overall_mean.cpu(),
+        "cos_x_trials": cos_trials.cpu(),
+        "cos_steps_by_N": {N: cos_steps_by_N[N].numpy() for N in particle_counts},
+    }

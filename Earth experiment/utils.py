@@ -396,6 +396,123 @@ def get_vmf_f(kappa):
     return f
 
 
+# ============================================================
+# Seismic / "two-point" inverse problem likelihood kernels
+# ============================================================
+
+def seismic_signal(x: torch.Tensor, y: torch.Tensor, beta: float) -> torch.Tensor:
+    """
+    Seismic signal model: I(x, y) = exp(beta * (<x, y> - 1))
+
+    Maximum I = 1 when x = y; decays smoothly as geodesic distance grows.
+
+    x, y : (..., 3) tensors on S^2 (need not be unit-normalised on input).
+    Returns (...) tensor of values in (0, 1].
+    """
+    ip = (normalize_torch(x) * normalize_torch(y)).sum(dim=-1)
+    return torch.exp(beta * (ip - 1.0))
+
+
+def get_seismic_f_fn(y_sensor, u_obs, beta: float, sigma2: float):
+    """
+    Single-sensor seismic likelihood kernel for use with get_bel.
+
+    Implements:
+        f(x) = exp( -(u - I(x, y))^2 / (2 sigma^2) )
+        I(x, y) = exp(beta * (<x, y> - 1))
+
+    Parameters
+    ----------
+    y_sensor : array-like, shape (3,)
+        Sensor location on S^2.
+    u_obs : float
+        Scalar observation.
+    beta : float
+        Signal decay rate (beta > 0).
+    sigma2 : float
+        Observation noise variance.
+
+    Returns
+    -------
+    f_fn : callable
+        f_fn(X, dummy_y) -> tensor matching the leading dimensions of X
+        with the last spatial dimension reduced.
+        Compatible with bel_gradlog_u_S2_batch_chunked_torch (X shape: (B, P, 3)).
+    """
+    def f_fn(X: torch.Tensor, dummy_y: torch.Tensor) -> torch.Tensor:
+        y_t = torch.as_tensor(y_sensor, device=X.device, dtype=X.dtype)
+        u_t = torch.as_tensor(u_obs, device=X.device, dtype=X.dtype)
+        ip = (X * y_t).sum(dim=-1)          # (...) via broadcasting (3,) onto last dim
+        I = torch.exp(beta * (ip - 1.0))
+        return torch.exp(-(u_t - I) ** 2 / (2.0 * sigma2))
+    return f_fn
+
+
+def get_two_point_seismic_f_fn(
+    y1, y2, u1_obs, u2_obs, beta: float, sigma2: float
+):
+    """
+    Two-sensor seismic likelihood kernel for use with get_bel.
+
+    Joint likelihood for observations (u1, y1) and (u2, y2):
+        f(x) = exp( -(u1 - I(x,y1))^2 / (2 sigma^2) )
+             * exp( -(u2 - I(x,y2))^2 / (2 sigma^2) )
+        I(x, y) = exp(beta * (<x, y> - 1))
+
+    Parameters
+    ----------
+    y1, y2 : array-like, shape (3,)
+        Sensor locations on S^2.
+    u1_obs, u2_obs : float or 1-D tensor of shape (K,)
+        Observations at each sensor.
+        - Scalar: single trial; f_fn works for any DPnP batch size B.
+        - Shape (K,): K batched trials; DPnP must be called with batch size B = K.
+          In this case BEL receives X of shape (K*P, n_bel, 3) and the
+          function recovers P = (K*P) // K to broadcast u correctly.
+    beta : float
+        Signal decay rate.
+    sigma2 : float
+        Observation noise variance.
+
+    Returns
+    -------
+    f_fn : callable
+        f_fn(X, dummy_y) -> (B_total, n_bel) tensor.
+        Compatible with bel_gradlog_u_S2_batch_chunked_torch.
+    """
+    u1_t = torch.as_tensor(u1_obs) if not torch.is_tensor(u1_obs) else u1_obs.detach().cpu()
+    u2_t = torch.as_tensor(u2_obs) if not torch.is_tensor(u2_obs) else u2_obs.detach().cpu()
+    batched = u1_t.dim() > 0 and u1_t.numel() > 1
+    K = int(u1_t.numel()) if batched else None
+
+    def f_fn(X: torch.Tensor, dummy_y: torch.Tensor) -> torch.Tensor:
+        y1_t = torch.as_tensor(y1, device=X.device, dtype=X.dtype)
+        y2_t = torch.as_tensor(y2, device=X.device, dtype=X.dtype)
+        u1 = u1_t.to(device=X.device, dtype=X.dtype)
+        u2 = u2_t.to(device=X.device, dtype=X.dtype)
+
+        ip1 = (X * y1_t).sum(dim=-1)       # (B_total, n_bel) via broadcast
+        ip2 = (X * y2_t).sum(dim=-1)
+        I1 = torch.exp(beta * (ip1 - 1.0))
+        I2 = torch.exp(beta * (ip2 - 1.0))
+
+        if batched:
+            # X: (K * P_dpnp, n_bel, 3)
+            B_total = X.shape[0]
+            P_dpnp = B_total // K
+            u1_exp = u1.unsqueeze(1).expand(K, P_dpnp).reshape(B_total, 1)
+            u2_exp = u2.unsqueeze(1).expand(K, P_dpnp).reshape(B_total, 1)
+        else:
+            u1_exp = u1
+            u2_exp = u2
+
+        like1 = torch.exp(-(u1_exp - I1) ** 2 / (2.0 * sigma2))
+        like2 = torch.exp(-(u2_exp - I2) ** 2 / (2.0 * sigma2))
+        return like1 * like2
+
+    return f_fn
+
+
 # =========================================================
 # Geometry helpers on S^2
 # =========================================================
