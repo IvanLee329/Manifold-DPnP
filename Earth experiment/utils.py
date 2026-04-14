@@ -461,14 +461,15 @@ def get_two_point_seismic_f_fn(
 
     Parameters
     ----------
-    y1, y2 : array-like, shape (3,)
+    y1, y2 : array-like
         Sensor locations on S^2.
+        - Shape (3,)   : one shared sensor for all batch items.
+        - Shape (K, 3) : per-item sensors (K must match len(u1_obs)).
     u1_obs, u2_obs : float or 1-D tensor of shape (K,)
         Observations at each sensor.
-        - Scalar: single trial; f_fn works for any DPnP batch size B.
-        - Shape (K,): K batched trials; DPnP must be called with batch size B = K.
-          In this case BEL receives X of shape (K*P, n_bel, 3) and the
-          function recovers P = (K*P) // K to broadcast u correctly.
+        - Scalar : single trial; f_fn works for any DPnP batch size B.
+        - Shape (K,) : K batched trials; DPnP must be called with batch size B = K.
+          BEL receives X of shape (K*P, n_bel, 3) and recovers P = (K*P) // K.
     beta : float
         Signal decay rate.
     sigma2 : float
@@ -485,27 +486,50 @@ def get_two_point_seismic_f_fn(
     batched = u1_t.dim() > 0 and u1_t.numel() > 1
     K = int(u1_t.numel()) if batched else None
 
-    def f_fn(X: torch.Tensor, dummy_y: torch.Tensor) -> torch.Tensor:
-        y1_t = torch.as_tensor(y1, device=X.device, dtype=X.dtype)
-        y2_t = torch.as_tensor(y2, device=X.device, dtype=X.dtype)
-        u1 = u1_t.to(device=X.device, dtype=X.dtype)
-        u2 = u2_t.to(device=X.device, dtype=X.dtype)
+    # Pre-convert sensors; keep on CPU and move inside f_fn
+    y1_t = torch.as_tensor(y1).float().detach().cpu()
+    y2_t = torch.as_tensor(y2).float().detach().cpu()
+    y1_per_item = y1_t.dim() == 2  # True when shape is (K, 3)
+    y2_per_item = y2_t.dim() == 2
 
-        ip1 = (X * y1_t).sum(dim=-1)       # (B_total, n_bel) via broadcast
-        ip2 = (X * y2_t).sum(dim=-1)
-        I1 = torch.exp(beta * (ip1 - 1.0))
-        I2 = torch.exp(beta * (ip2 - 1.0))
+    def f_fn(X: torch.Tensor, dummy_y: torch.Tensor) -> torch.Tensor:
+        dev, dt = X.device, X.dtype
+        u1 = u1_t.to(device=dev, dtype=dt)
+        u2 = u2_t.to(device=dev, dtype=dt)
+        _y1 = y1_t.to(device=dev, dtype=dt)
+        _y2 = y2_t.to(device=dev, dtype=dt)
+
+        B_total = X.shape[0]
 
         if batched:
             # X: (K * P_dpnp, n_bel, 3)
-            B_total = X.shape[0]
             P_dpnp = B_total // K
+
+            # ---- sensor inner products ----
+            if y1_per_item:
+                # _y1: (K, 3) → (K, P_dpnp, 1, 3) → (B_total, 1, 3)
+                y1_exp = _y1.unsqueeze(1).expand(K, P_dpnp, 3).reshape(B_total, 1, 3)
+                ip1 = (X * y1_exp).sum(dim=-1)          # (B_total, n_bel)
+            else:
+                ip1 = (X * _y1).sum(dim=-1)             # broadcast (3,)
+
+            if y2_per_item:
+                y2_exp = _y2.unsqueeze(1).expand(K, P_dpnp, 3).reshape(B_total, 1, 3)
+                ip2 = (X * y2_exp).sum(dim=-1)
+            else:
+                ip2 = (X * _y2).sum(dim=-1)
+
+            # ---- observation broadcast ----
             u1_exp = u1.unsqueeze(1).expand(K, P_dpnp).reshape(B_total, 1)
             u2_exp = u2.unsqueeze(1).expand(K, P_dpnp).reshape(B_total, 1)
         else:
+            ip1 = (X * _y1).sum(dim=-1)
+            ip2 = (X * _y2).sum(dim=-1)
             u1_exp = u1
             u2_exp = u2
 
+        I1 = torch.exp(beta * (ip1 - 1.0))
+        I2 = torch.exp(beta * (ip2 - 1.0))
         like1 = torch.exp(-(u1_exp - I1) ** 2 / (2.0 * sigma2))
         like2 = torch.exp(-(u2_exp - I2) ** 2 / (2.0 * sigma2))
         return like1 * like2
