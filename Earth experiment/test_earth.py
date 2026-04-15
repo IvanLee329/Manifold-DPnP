@@ -1177,13 +1177,13 @@ def _reconstruction_score(x_recon: torch.Tensor, x_true: torch.Tensor, metric: s
     Compute per-sample reconstruction quality.
 
     metric="cosine"  : dot product <x_recon, x_true> in [-1, 1], higher is better.
-    metric="geodesic": great-circle distance in degrees in [0, 180], lower is better.
+    metric="geodesic": great-circle distance in radians in [0, π], lower is better.
     """
     dot = (x_recon * x_true).sum(dim=-1).clamp(-1.0, 1.0)
     if metric == "cosine":
         return dot
     elif metric == "geodesic":
-        return torch.rad2deg(torch.arccos(dot))
+        return torch.arccos(dot)
     else:
         raise ValueError(f"metric must be 'cosine' or 'geodesic', got '{metric}'")
 
@@ -1239,7 +1239,7 @@ def cosine_similarity_vs_steps_two_point(
     num_pairs: int = 64,
     batch_eval_size: int = 8,
     include_baseline: bool = True,
-    mcmc_kappa_prop: float = 50.0,
+    mcmc_tau: float = 0.1,
     mcmc_n_burnin: int = 500,
     device="mps",
     dtype=torch.float32,
@@ -1271,7 +1271,7 @@ def cosine_similarity_vs_steps_two_point(
                     Larger kappa = sensors closer to x_true.
     metric        : "cosine" (default) or "geodesic"
                     "cosine"   -- dot product in [-1,1], higher is better.
-                    "geodesic" -- great-circle distance in degrees, lower is better.
+                    "geodesic" -- great-circle distance in radians, lower is better.
     n_bel_paths, n_bel_steps : BEL hyper-parameters
     particle_counts : N values to evaluate
     out_samples   : total particles per DPnP call (>= max(particle_counts))
@@ -1280,14 +1280,14 @@ def cosine_similarity_vs_steps_two_point(
     batch_eval_size : how many triples to batch into one DPnP call
     include_baseline : bool (default True)
                     If True, also sample from the likelihood-only posterior
-                    q(x) ∝ p(u1|x,y1) p(u2|x,y2) using Metropolis-Hastings
-                    on S² and overlay results as horizontal dashed lines on
-                    the quality-vs-step plot.
+                    q(x) ∝ p(u1|x,y1) p(u2|x,y2) using geodesic random-walk
+                    Metropolis on S² and overlay results as horizontal dashed
+                    lines on the quality-vs-step plot.
                     Note: DPnP with p_score≡0 does NOT achieve this — the
                     BEL bridge p(x0|xt) ∝ p(xt|x0) p0(x0) implicitly uses
                     the earthquake prior, so the baseline must be independent
                     of the learned score model.
-    mcmc_kappa_prop : vMF proposal concentration for MCMC (default 50.0).
+    mcmc_tau        : geodesic step size for MCMC baseline (default 0.1).
     mcmc_n_burnin   : burn-in steps for MCMC (default 500).
     seed          : random seed
 
@@ -1391,7 +1391,7 @@ def cosine_similarity_vs_steps_two_point(
                 log_target_fn=log_tgt,
                 B=B,
                 n_samples=out_samples,
-                kappa_prop=mcmc_kappa_prop,
+                tau=mcmc_tau,
                 n_burnin=mcmc_n_burnin,
                 device=device,
                 dtype=dtype,
@@ -1436,7 +1436,7 @@ def cosine_similarity_vs_steps_two_point(
                                              / np.sqrt(cat_bl.shape[0]))
 
     steps = np.arange(S_plus_1)
-    ylabel = "mean cosine similarity" if metric == "cosine" else "mean geodesic distance (°)"
+    ylabel = "mean cosine similarity" if metric == "cosine" else "mean geodesic distance (rad)"
     better = "↑ better" if metric == "cosine" else "↓ better"
 
     # ---- summary print ----
@@ -1535,7 +1535,7 @@ def run_two_point_earthquake_demo(
     plot_global: bool = True,
     plot_quality_vs_steps: bool = True,
     include_baseline: bool = True,
-    mcmc_kappa_prop: float = 50.0,
+    mcmc_tau: float = 0.1,
     mcmc_n_burnin: int = 500,
     device="mps",
     dtype=torch.float32,
@@ -1589,13 +1589,13 @@ def run_two_point_earthquake_demo(
     include_baseline    : bool (default True)
                           If True, also draw samples from the likelihood-only
                           posterior q(x) ∝ p(u1|x,y1) p(u2|x,y2) using
-                          Metropolis-Hastings on S² (no score network), and
-                          overlay results on all plots.
+                          geodesic random-walk Metropolis on S² (no score
+                          network), and overlay results on all plots.
                           Note: DPnP with p_score≡0 does NOT achieve this —
                           BEL bridge paths use p(x0|xt)∝p(xt|x0)p0(x0),
                           embedding the earthquake prior regardless of p_score.
-    mcmc_kappa_prop     : float (default 50.0)
-                          vMF proposal concentration for the MCMC baseline.
+    mcmc_tau            : float (default 0.1)
+                          Geodesic step size for the MCMC baseline.
     mcmc_n_burnin       : int (default 500)
                           Burn-in steps for the MCMC baseline.
     seed                : base random seed
@@ -1668,7 +1668,7 @@ def run_two_point_earthquake_demo(
             y2_sensors = y2_t
         sensor_desc = "fixed sensors"
 
-    ylabel  = "cosine similarity" if metric == "cosine" else "geodesic distance (°)"
+    ylabel  = "cosine similarity" if metric == "cosine" else "geodesic distance (rad)"
     better  = "(↑ better)"        if metric == "cosine" else "(↓ better)"
 
     # ── 2. True seismic signals and noisy observations ────────────────────────
@@ -1751,7 +1751,7 @@ def run_two_point_earthquake_demo(
         score_steps_by_N[N] = sc.reshape(STEPS + 1, S, T).cpu()     # (STEPS+1, S, T)
 
     # ── 6b. Baseline: MCMC on S² (likelihood-only) ───────────────────────────
-    # Samples from q(x) ∝ p(u1|x,y1) p(u2|x,y2) via Metropolis-Hastings.
+    # Samples from q(x) ∝ p(u1|x,y1) p(u2|x,y2) via geodesic random-walk Metropolis.
     # DPnP with p_score≡0 is NOT a valid baseline: BEL bridge paths use
     # p(x0|xt) ∝ p(xt|x0) p0(x0), which embeds the earthquake prior p0 in
     # the score estimate regardless of what p_score returns.
@@ -1770,7 +1770,7 @@ def run_two_point_earthquake_demo(
             log_target_fn=log_target,
             B=S * T,
             n_samples=P,
-            kappa_prop=mcmc_kappa_prop,
+            tau=mcmc_tau,
             n_burnin=mcmc_n_burnin,
             device=device,
             dtype=dtype,
@@ -1858,7 +1858,7 @@ def run_two_point_earthquake_demo(
                 # sensor-pair mean (DPnP)
                 (sensor_mean_s[None],
                  dict(s=130, color="gold", marker="*", edgecolors="black",
-                      linewidths=1.2, zorder=9, label="DPnP sensor mean")),
+                      linewidths=1.2, zorder=9, label="DPnP reconstruction mean")),
                 # sensors
                 (y1s[None],
                  dict(s=80, color="tab:cyan", marker="D", edgecolors="black",
@@ -1873,12 +1873,18 @@ def run_two_point_earthquake_demo(
                       label=r"$x'$ (reflection, same likelihood)")),
             ]
 
-            # optionally overlay baseline trial means
+            # optionally overlay baseline trial means and reconstruction mean
             if include_baseline and trial_means_bl is not None:
                 extra.append((
                     trial_means_bl[s].cpu(),
                     dict(s=20, color="tab:pink", alpha=0.7, edgecolors="none",
                          zorder=6, label=f"baseline trial means (T={T})"),
+                ))
+                bl_sensor_mean_s = sphere_mean_torch(trial_means_bl[s].cpu(), dim=0)
+                extra.append((
+                    bl_sensor_mean_s[None],
+                    dict(s=130, color="tab:pink", marker="*", edgecolors="black",
+                         linewidths=1.2, zorder=9, label="baseline reconstruction mean"),
                 ))
 
             score_s = score_sensors[s].item()
@@ -1904,7 +1910,7 @@ def run_two_point_earthquake_demo(
                 sm[None],
                 dict(s=70, color=col, marker="o", edgecolors="black",
                      linewidths=1.0, zorder=7,
-                     label=f"DPnP sensor mean {s+1}" if s < 6 else None,
+                     label=f"DPnP reconstruction mean {s+1}" if s < 6 else None,
                      alpha=0.85),
             ))
             # reflection point for each sensor pair
@@ -1920,9 +1926,15 @@ def run_two_point_earthquake_demo(
                  linewidths=1.4, zorder=9, label="DPnP global mean"),
         ))
         if include_baseline and trial_means_bl is not None:
-            bl_global_mean = sphere_mean_torch(
-                trial_means_bl.reshape(S * T, 3).cpu(), dim=0
-            )
+            bl_sensor_means = sphere_mean_torch(trial_means_bl.cpu(), dim=1)  # (S, 3)
+            for s in range(S):
+                extra_global.append((
+                    bl_sensor_means[s][None],
+                    dict(s=70, color="tab:pink", marker="o", edgecolors="black",
+                         linewidths=1.0, zorder=7, alpha=0.85,
+                         label=f"baseline reconstruction mean {s+1}" if s < 6 else None),
+                ))
+            bl_global_mean = sphere_mean_torch(bl_sensor_means, dim=0)
             extra_global.append((
                 bl_global_mean[None],
                 dict(s=160, color="tab:pink", marker="*", edgecolors="black",

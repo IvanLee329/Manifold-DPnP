@@ -9,8 +9,8 @@ import matplotlib.pyplot as plt
 from utils import get_vmf_f
 device = "cuda" if torch.cuda.is_available() else "mps"
 
-hidden_dim = 256
-n_hidden_layers = 4
+hidden_dim = 512
+n_hidden_layers = 5
 MODEL_PATH = "p_score_model_weights.pth" 
 KAPPA = 30
 
@@ -76,7 +76,7 @@ results2 = test_dpnp_sampler_multiple_xtrue(
     dtype=torch.float32,
     seed=2,
     kappa=25.0,
-    plot_results=False
+    plot_results=True
 )
 save_dict = {
     "results": results2,

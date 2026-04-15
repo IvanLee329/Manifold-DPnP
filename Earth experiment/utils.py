@@ -760,7 +760,7 @@ def mollweide_plot_grid_xyz_torch(
 
 
 # ============================================================
-# Batched Metropolis-Hastings sampler on S^2
+# Batched geodesic random-walk Metropolis sampler on S^2
 # ============================================================
 
 @torch.no_grad()
@@ -768,21 +768,27 @@ def mcmc_mh_s2_batched(
     log_target_fn,
     B: int,
     n_samples: int,
-    kappa_prop: float = 30.0,
+    tau: float = 0.1,
     n_burnin: int = 500,
     device="cpu",
     dtype=torch.float32,
     seed: int = 0,
 ) -> torch.Tensor:
     """
-    Batched Metropolis-Hastings sampler on S^2 using vMF proposals.
+    Batched geodesic random-walk Metropolis sampler on S^2.
 
     Runs B independent chains in parallel.  No score network required —
     samples directly from the unnormalised target density.
 
-    The vMF proposal q(x' | x) = vMF(x', μ=x, κ) is symmetric on S^2
-    (since <x',x> = <x,x'>), so the MH acceptance ratio reduces to
-    min(1, π(x')/π(x)) = min(1, exp(log π(x') − log π(x))).
+    At each iteration k the proposal is:
+        1. z ~ N(0, I_3)
+        2. v = (I - x x^T) z            (project onto tangent space T_x S^2)
+        3. x* = Exp_x(τ v)              (move along the geodesic)
+    where Exp_x(w) = cos(||w||) x + sin(||w||) w/||w||.
+
+    The isotropic tangent noise gives a symmetric proposal on S^2,
+    so the MH acceptance ratio reduces to
+        α = min{1, q(x*) / q(x^{(k)})}.
 
     Parameters
     ----------
@@ -791,7 +797,8 @@ def mcmc_mh_s2_batched(
         Need not be normalised; only differences matter.
     B             : int   -- number of independent chains
     n_samples     : int   -- samples to keep per chain (after burn-in)
-    kappa_prop    : float -- vMF proposal concentration (higher → smaller steps)
+    tau           : float -- geodesic step size (> 0, smaller → higher
+                             acceptance but slower mixing)
     n_burnin      : int   -- burn-in steps discarded before recording
     device, dtype, seed
 
@@ -815,16 +822,22 @@ def mcmc_mh_s2_batched(
     accepted_total = 0.0
 
     for step in range(n_total):
-        # ── vMF proposal (symmetric on S^2) ─────────────────────────────
-        x_prop = sample_vmf_s2(mu=x, kappa=kappa_prop, generator=gen)  # (B, 3)
-        log_q_prop = log_target_fn(x_prop)                              # (B,)
+        # ── geodesic random-walk proposal ────────────────────────────────
+        # 1. sample tangent perturbation at current point x
+        z = torch.randn(B, 3, device=device, dtype=dtype, generator=gen)
+        v = tangent_project_torch(x, z)                    # (B, 3)
 
-        # ── Acceptance ───────────────────────────────────────────────────
-        log_alpha = (log_q_prop - log_q).clamp(max=0.0)                 # (B,)
+        # 2. propose by moving along the geodesic with step size τ
+        x_prop = sphere_exp_map_torch(x, tau * v)          # (B, 3)
+
+        log_q_prop = log_target_fn(x_prop)                 # (B,)
+
+        # ── Acceptance (symmetric proposal → target ratio only) ──────────
+        log_alpha = (log_q_prop - log_q).clamp(max=0.0)    # (B,)
         u = torch.rand(B, device=device, dtype=dtype, generator=gen)
-        accept = u < log_alpha.exp()                                     # (B,) bool
+        accept = u < log_alpha.exp()                        # (B,) bool
 
-        x    = torch.where(accept.unsqueeze(-1), x_prop, x)
+        x     = torch.where(accept.unsqueeze(-1), x_prop, x)
         log_q = torch.where(accept, log_q_prop, log_q)
 
         accepted_total += accept.float().mean().item()
