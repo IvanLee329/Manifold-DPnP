@@ -309,6 +309,157 @@ def sample_vmf_s2(
     return x
 
 
+def _kent_frame(mu: torch.Tensor, eps: float = 1e-12):
+    """
+    Compute a right-handed orthonormal frame (γ₁, γ₂) in the tangent plane of μ.
+    γ₁ is chosen perpendicular to μ by Gram-Schmidt against the coordinate axis
+    with the smallest absolute projection on μ.  γ₂ = μ × γ₁.
+
+    Parameters
+    ----------
+    mu : (..., 3) tensor, unit vectors on S²
+
+    Returns
+    -------
+    gamma1, gamma2 : (..., 3) tensors — orthonormal, tangent to S² at μ
+    """
+    mu = normalize_torch(mu, eps=eps)
+    # Axis least aligned with mu
+    idx = mu.abs().argmin(dim=-1, keepdim=True)        # (..., 1)
+    e = torch.zeros_like(mu)
+    e.scatter_(-1, idx, 1.0)                           # canonical axis
+    # Gram-Schmidt
+    gamma1 = normalize_torch(e - (e * mu).sum(-1, keepdim=True) * mu, eps=eps)
+    gamma2 = torch.linalg.cross(mu, gamma1, dim=-1)
+    return gamma1, gamma2
+
+
+@torch.no_grad()
+def sample_kent_s2(
+    mu: torch.Tensor,
+    kappa: float,
+    beta: float,
+    n_samples: int | None = None,
+    generator=None,
+    eps: float = 1e-12,
+    keep_sample_dim: bool = False,
+    max_rejection_iters: int = 500,
+) -> torch.Tensor:
+    """
+    Sample from the Kent (FB5) distribution on S²:
+        p(x | μ, κ, β) ∝ exp(κ⟨μ,x⟩ + β(⟨γ₁,x⟩² − ⟨γ₂,x⟩²))
+
+    Uses rejection sampling with vMF(μ, κ) as the envelope.
+    Since the Kent/vMF ratio is exp(β(⟨γ₁,x⟩²−⟨γ₂,x⟩²)) ≤ exp(β),
+    the normalised acceptance probability is:
+        p(accept | x) = exp(β(⟨γ₁,x⟩² − ⟨γ₂,x⟩²) − β)   ∈ (0, 1]
+
+    Requires 0 ≤ 2β < κ for the distribution to be proper.
+
+    Parameters
+    ----------
+    mu        : (..., 3) tensor — mean direction(s) on S²
+    kappa     : float           — concentration κ  (κ > 0)
+    beta      : float           — ovalness β       (0 ≤ 2β < κ)
+    n_samples : int or None     — samples per mu  (None → one per mu)
+    generator : torch.Generator, optional
+    eps       : float
+    keep_sample_dim : bool
+    max_rejection_iters : int   — safety cap on rejection loop
+
+    Returns
+    -------
+    x : (..., 3) or (..., n_samples, 3)
+    """
+    if beta < 0:
+        raise ValueError("beta must be >= 0")
+    if 2.0 * beta >= kappa:
+        raise ValueError(
+            f"Kent distribution requires 2*beta < kappa, got 2*beta={2*beta}, kappa={kappa}"
+        )
+
+    mu = normalize_torch(mu, eps=eps)
+    gamma1, gamma2 = _kent_frame(mu, eps=eps)
+    device, dtype = mu.device, mu.dtype
+    lead_shape = mu.shape[:-1]
+
+    if n_samples is None:
+        n_samples = 1
+        squeeze_output = not keep_sample_dim
+    else:
+        if n_samples < 1:
+            raise ValueError("n_samples must be >= 1")
+        squeeze_output = (n_samples == 1) and (not keep_sample_dim)
+
+    # Flatten leading dims to (B, 3) for rejection loop
+    B = int(math.prod(lead_shape)) if lead_shape else 1
+    mu_flat     = mu.reshape(B, 3)
+    gamma1_flat = gamma1.reshape(B, 3)
+    gamma2_flat = gamma2.reshape(B, 3)
+
+    # collected[b] = list of accepted (k, 3) tensors; counts[b] = accepted so far
+    collected = [[] for _ in range(B)]
+    counts    = [0]   * B
+
+    for _ in range(max_rejection_iters):
+        if all(c >= n_samples for c in counts):
+            break
+        # How many more we need in the worst case
+        needed_max = max(n_samples - c for c in counts)
+        # Oversample 4× to keep the loop short
+        n_draw = needed_max * 4
+
+        # Draw from vMF(μ_flat, κ) for all B simultaneously
+        cands = sample_vmf_s2(
+            mu_flat, kappa,
+            n_samples=n_draw,
+            generator=generator,
+            keep_sample_dim=True,
+        )   # (B, n_draw, 3)
+
+        # Acceptance log-probability
+        c1 = (cands * gamma1_flat[:, None, :]).sum(-1)   # (B, n_draw)
+        c2 = (cands * gamma2_flat[:, None, :]).sum(-1)
+        log_accept = beta * (c1 ** 2 - c2 ** 2) - beta   # ≤ 0
+
+        u = torch.rand(
+            log_accept.shape, device=device, dtype=dtype, generator=generator
+        )
+        accept_mask = u < log_accept.exp()                # (B, n_draw) bool
+
+        for b in range(B):
+            if counts[b] >= n_samples:
+                continue
+            accepted_b = cands[b][accept_mask[b]]         # (k, 3)
+            need_more  = n_samples - counts[b]
+            take       = min(accepted_b.shape[0], need_more)
+            if take > 0:
+                collected[b].append(accepted_b[:take])
+                counts[b] += take
+
+    # Assemble result
+    result_parts = []
+    for b in range(B):
+        if collected[b]:
+            samp_b = torch.cat(collected[b], dim=0)[:n_samples]   # (n_samples, 3)
+        else:
+            # Fallback: use plain vMF (should not happen in practice)
+            # mu_flat[b] is (3,), so output is (n_samples, 3)
+            samp_b = sample_vmf_s2(
+                mu_flat[b], kappa, n_samples=n_samples,
+                generator=generator, keep_sample_dim=True,
+            )   # (n_samples, 3)
+        result_parts.append(samp_b)
+
+    result = torch.stack(result_parts, dim=0)            # (B, n_samples, 3)
+    result = result.reshape(*lead_shape, n_samples, 3)
+    result = normalize_torch(result, eps=eps)
+
+    if squeeze_output:
+        result = result.squeeze(-2)
+    return result
+
+
 ####################################################################
 @torch.no_grad()
 def sample_geodesic_gaussian_on_sphere(

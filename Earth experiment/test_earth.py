@@ -25,6 +25,7 @@ from utils import (
     extrinsic_to_mollweide_rad_torch,
     mollweide_plot_grid_xyz_torch,
     sample_vmf_s2,
+    sample_kent_s2,
     seismic_signal,
     get_seismic_f_fn,
     get_two_point_seismic_f_fn,
@@ -1230,6 +1231,7 @@ def cosine_similarity_vs_steps_two_point(
     beta: float = 10.0,
     sigma2: float = 0.05,
     kappa_sensors: float | None = None,
+    kent_beta: float | None = None,
     metric: str = "cosine",
     n_bel_paths: int = 5000,
     n_bel_steps: int = 5,
@@ -1267,9 +1269,14 @@ def cosine_similarity_vs_steps_two_point(
     beta          : float       -- seismic signal decay rate
     sigma2        : float       -- observation noise variance
     kappa_sensors : float or None
-                    If given, sample y1_i, y2_i ~ vMF(x_true_i, kappa_sensors)
-                    independently for each x_true instead of using fixed y1, y2.
-                    Larger kappa = sensors closer to x_true.
+                    If given, sample y1_i, y2_i from a distribution centred on
+                    x_true_i independently for each x_true instead of fixed y1/y2.
+                    Larger kappa → sensors closer to x_true.
+    kent_beta     : float or None (default None)
+                    If set together with kappa_sensors, sensors are drawn from
+                    the Kent distribution Kent(x_true, kappa_sensors, kent_beta).
+                    Requires 0 ≤ 2*kent_beta < kappa_sensors.
+                    When None, plain vMF is used.
     metric        : "cosine" (default) or "geodesic"
                     "cosine"   -- dot product in [-1,1], higher is better.
                     "geodesic" -- great-circle distance in radians, lower is better.
@@ -1344,9 +1351,18 @@ def cosine_similarity_vs_steps_two_point(
 
         # ---- sensor locations for this mini-batch ----
         if kappa_sensors is not None:
-            # Sample y1_b, y2_b per x_true ~ vMF(x_true, kappa_sensors)
-            y1_b = sample_vmf_s2(mu=x_batch, kappa=kappa_sensors, generator=gen)  # (B, 3)
-            y2_b = sample_vmf_s2(mu=x_batch, kappa=kappa_sensors, generator=gen)  # (B, 3)
+            if kent_beta is not None:
+                # Sample y1_b, y2_b per x_true ~ Kent(x_true, kappa_sensors, kent_beta)
+                y1_b = sample_kent_s2(
+                    mu=x_batch, kappa=kappa_sensors, beta=kent_beta, generator=gen,
+                )   # (B, 3)
+                y2_b = sample_kent_s2(
+                    mu=x_batch, kappa=kappa_sensors, beta=kent_beta, generator=gen,
+                )   # (B, 3)
+            else:
+                # Sample y1_b, y2_b per x_true ~ vMF(x_true, kappa_sensors)
+                y1_b = sample_vmf_s2(mu=x_batch, kappa=kappa_sensors, generator=gen)  # (B, 3)
+                y2_b = sample_vmf_s2(mu=x_batch, kappa=kappa_sensors, generator=gen)  # (B, 3)
         else:
             y1_b = y1   # (3,) broadcast for all items in batch
             y2_b = y2
@@ -1535,10 +1551,13 @@ def run_two_point_earthquake_demo(
     out_samples: int = 32,
     grw_steps: int = 5,
     particle_counts=(1, 5, 10, 20),
+    kent_beta: float | None = None,
     kde_kappa: float = 25.0,
     plot_per_sensor: bool = True,
     plot_global: bool = True,
     plot_quality_vs_steps: bool = True,
+    plot_3d: bool = False,
+    show_kde: bool = True,
     include_baseline: bool = True,
     mcmc_tau: float = 0.1,
     mcmc_use_mala: bool = False,
@@ -1572,26 +1591,34 @@ def run_two_point_earthquake_demo(
     n_sensor_pairs      : int (S) -- number of (y1, y2) configurations
     n_trials_per_sensor : int (T) -- number of (u1, u2) draws per sensor pair
     kappa_sensors       : float or None
-                          Sample y1_s, y2_s ~ vMF(x_true, kappa_sensors)
-                          independently for each s.  Larger kappa → sensors
-                          closer to x_true.  When set, y1/y2 are ignored.
+                          Sample y1_s, y2_s from a distribution centred on
+                          x_true, independently for each s.  When set, y1/y2
+                          are ignored.  Larger kappa → sensors closer to x_true.
+    kent_beta           : float or None (default None)
+                          If set together with kappa_sensors, sensors are sampled
+                          from the Kent (FB5) distribution
+                              p(x|μ,κ,β) ∝ exp(κ⟨μ,x⟩ + β(⟨γ₁,x⟩²−⟨γ₂,x⟩²))
+                          with μ=x_true, κ=kappa_sensors, β=kent_beta.
+                          Requires 0 ≤ 2β < κ.  When None, plain vMF is used.
     metric              : "cosine" (default) or "geodesic"
     n_bel_paths, n_bel_steps : BEL hyper-parameters
     out_samples         : DPnP particles P per trial
     grw_steps           : SDE integration steps per DPnP outer step
     particle_counts     : N values for the quality-vs-step plot
-    kde_kappa           : vMF bandwidth for Mollweide KDE plots
+    kde_kappa           : vMF bandwidth for KDE plots (ignored when show_kde=False)
     plot_per_sensor     : bool (default True)
-                          One Mollweide plot per sensor pair showing the KDE
-                          of all T*P particles, the T individual trial-mean
-                          markers, the sensor-pair mean, x_true, y1/y2, and
-                          the reflection point (ambiguous likelihood partner).
+                          One plot per sensor pair.
     plot_global         : bool (default True)
-                          One Mollweide plot with the KDE of all S*T trial
-                          means, one marker per sensor-pair mean, and the
-                          global mean.
+                          One plot across all sensor pairs.
     plot_quality_vs_steps : bool (default True)
                           Quality metric vs DPnP step, averaged over all S*T.
+    plot_3d             : bool (default False)
+                          If True, render sphere plots in 3D (matplotlib 3D axes)
+                          so x_true and the sample cloud are visible on S².
+                          If False, use Mollweide projections (default).
+    show_kde            : bool (default True)
+                          If True, overlay a spherical KDE on the sphere surface.
+                          If False, scatter raw sample points only.
     include_baseline    : bool (default True)
                           If True, also draw samples from the likelihood-only
                           posterior q(x) ∝ p(u1|x,y1) p(u2|x,y2) using
@@ -1661,12 +1688,24 @@ def run_two_point_earthquake_demo(
 
     # ── 1. Sensor locations (S, 3) ────────────────────────────────────────────
     if kappa_sensors is not None:
-        y1_sensors = sample_vmf_s2(mu=x_true, kappa=kappa_sensors,
-                                   n_samples=S, generator=gen)   # (S, 3)
-        y2_sensors = sample_vmf_s2(mu=x_true, kappa=kappa_sensors,
-                                   n_samples=S, generator=gen)   # (S, 3)
-        sensor_desc = f"vMF sensors (kappa={kappa_sensors})"
-        print(f"Sampled {S} sensor pairs from vMF(x_true, kappa={kappa_sensors})")
+        if kent_beta is not None:
+            y1_sensors = sample_kent_s2(
+                mu=x_true, kappa=kappa_sensors, beta=kent_beta,
+                n_samples=S, generator=gen,
+            )   # (S, 3)
+            y2_sensors = sample_kent_s2(
+                mu=x_true, kappa=kappa_sensors, beta=kent_beta,
+                n_samples=S, generator=gen,
+            )   # (S, 3)
+            sensor_desc = f"Kent sensors (kappa={kappa_sensors}, beta={kent_beta})"
+            print(f"Sampled {S} sensor pairs from Kent(x_true, kappa={kappa_sensors}, beta={kent_beta})")
+        else:
+            y1_sensors = sample_vmf_s2(mu=x_true, kappa=kappa_sensors,
+                                       n_samples=S, generator=gen)   # (S, 3)
+            y2_sensors = sample_vmf_s2(mu=x_true, kappa=kappa_sensors,
+                                       n_samples=S, generator=gen)   # (S, 3)
+            sensor_desc = f"vMF sensors (kappa={kappa_sensors})"
+            print(f"Sampled {S} sensor pairs from vMF(x_true, kappa={kappa_sensors})")
     else:
         y1_t = normalize_torch(torch.as_tensor(y1, device=device, dtype=dtype))
         y2_t = normalize_torch(torch.as_tensor(y2, device=device, dtype=dtype))
@@ -1815,18 +1854,24 @@ def run_two_point_earthquake_demo(
     ]
 
     def _mollweide_ax(samples_3d, title_str, *, extra_markers=None):
-        """Draw a filled KDE contour on a Mollweide axis and return (fig, ax)."""
+        """Draw a Mollweide projection with optional KDE or raw scatter."""
         samp = normalize_torch(samples_3d.detach().cpu())
-        Lon, Lat, grid_xyz = mollweide_plot_grid_xyz_torch(
-            n_lon=240, n_lat=120, device=samp.device, dtype=samp.dtype)
-        dens = spherical_kde_vmf(samp, grid_xyz, kappa=kde_kappa, normalize=True)
-        dens_np = dens.reshape(Lon.shape).cpu().numpy()
 
         fig, ax = plt.subplots(1, 1, figsize=(11, 5.5),
                                subplot_kw={"projection": "mollweide"})
-        cf = ax.contourf(Lon.cpu().numpy(), Lat.cpu().numpy(), dens_np,
-                         levels=20, cmap="viridis")
-        fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
+
+        if show_kde:
+            Lon, Lat, grid_xyz = mollweide_plot_grid_xyz_torch(
+                n_lon=240, n_lat=120, device=samp.device, dtype=samp.dtype)
+            dens = spherical_kde_vmf(samp, grid_xyz, kappa=kde_kappa, normalize=True)
+            dens_np = dens.reshape(Lon.shape).cpu().numpy()
+            cf = ax.contourf(Lon.cpu().numpy(), Lat.cpu().numpy(), dens_np,
+                             levels=20, cmap="viridis")
+            fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
+        else:
+            ll_samp = extrinsic_to_mollweide_rad_torch(samp).numpy()
+            ax.scatter(ll_samp[:, 1], ll_samp[:, 0],
+                       s=5, alpha=0.35, color="tab:blue", label="particles", zorder=3)
 
         # x_true
         ll_x = extrinsic_to_mollweide_rad_torch(x_true.cpu()[None]).numpy()[0]
@@ -1849,6 +1894,73 @@ def run_two_point_earthquake_demo(
         plt.tight_layout()
         plt.show()
         return fig, ax
+
+    def _sphere_3d_ax(samples_3d, title_str, *, extra_markers=None):
+        """Draw samples on a 3D sphere with optional KDE surface coloring."""
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+        samp = normalize_torch(samples_3d.detach().cpu())
+        samp_np = samp.numpy()
+
+        fig = plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Build sphere mesh for surface / wireframe
+        u_ang = np.linspace(0, 2 * np.pi, 120)
+        v_ang = np.linspace(0,     np.pi,  60)
+        Ug, Vg = np.meshgrid(u_ang, v_ang)
+        Xs = np.sin(Vg) * np.cos(Ug)
+        Ys = np.sin(Vg) * np.sin(Ug)
+        Zs = np.cos(Vg)
+
+        if show_kde:
+            grid_np = np.stack([Xs, Ys, Zs], axis=-1).reshape(-1, 3)
+            grid_t  = torch.tensor(grid_np, dtype=dtype).cpu()
+            dens = spherical_kde_vmf(samp, grid_t, kappa=kde_kappa, normalize=True)
+            dens_np = dens.numpy().reshape(Vg.shape)
+            norm = plt.Normalize(dens_np.min(), dens_np.max())
+            facecolors = plt.cm.viridis(norm(dens_np))
+            ax.plot_surface(Xs, Ys, Zs, facecolors=facecolors,
+                            alpha=0.65, linewidth=0, antialiased=True)
+        else:
+            # Light wireframe
+            ax.plot_wireframe(Xs, Ys, Zs, color="lightgray",
+                              alpha=0.25, linewidth=0.3,
+                              rstride=4, cstride=4)
+            # Scatter raw samples
+            ax.scatter(samp_np[:, 0], samp_np[:, 1], samp_np[:, 2],
+                       s=5, alpha=0.4, color="tab:blue", label="particles")
+
+        # x_true
+        xt_np = x_true.cpu().numpy()
+        ax.scatter([xt_np[0]], [xt_np[1]], [xt_np[2]],
+                   s=120, color="tab:red", edgecolors="black",
+                   linewidths=1.2, zorder=10, depthshade=False,
+                   label=r"$x_{\rm true}$")
+
+        if extra_markers:
+            for pts, kwargs in extra_markers:
+                pts_np = normalize_torch(pts.detach().cpu()).numpy()
+                if pts_np.ndim == 1:
+                    pts_np = pts_np[None]
+                kw3d = {k: v for k, v in kwargs.items()
+                        if k not in ("edgecolors", "linewidths")}
+                kw3d.setdefault("depthshade", False)
+                ax.scatter(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2], **kw3d)
+
+        ax.set_title(title_str, pad=12)
+        ax.legend(loc="upper right", fontsize=7)
+        ax.set_box_aspect([1, 1, 1])
+        plt.tight_layout()
+        plt.show()
+        return fig, ax
+
+    def _plot_ax(samples_3d, title_str, *, extra_markers=None):
+        """Dispatch to 3D or Mollweide plot depending on plot_3d flag."""
+        if plot_3d:
+            return _sphere_3d_ax(samples_3d, title_str, extra_markers=extra_markers)
+        else:
+            return _mollweide_ax(samples_3d, title_str, extra_markers=extra_markers)
 
     sensor_colors = plt.cm.tab10(np.linspace(0, 1, max(S, 2)))
 
@@ -1881,7 +1993,7 @@ def run_two_point_earthquake_demo(
                       linewidths=1.0, zorder=8, label=r"$y_2$")),
                 # reflection point: identical likelihood as x_true
                 (xr_s[None],
-                 dict(s=110, color="tab:purple", marker="X", edgecolors="black",
+                 dict(s=110, color="tab:green", marker="X", edgecolors="black",
                       linewidths=1.0, zorder=10,
                       label=r"$x'$ (reflection, same likelihood)")),
             ]
@@ -1901,11 +2013,12 @@ def run_two_point_earthquake_demo(
                 ))
 
             score_s = score_sensors[s].item()
-            _mollweide_ax(
+            _plot_ax(
                 all_particles_s,
                 title_str=(
                     f"Sensor pair {s + 1}/{S} — {sensor_desc}\n"
-                    f"KDE of {T}×{P} DPnP particles | sensor-mean {ylabel}={score_s:.4f} {better}"
+                    f"{'KDE' if show_kde else 'Scatter'} of {T}×{P} DPnP particles | "
+                    f"sensor-mean {ylabel}={score_s:.4f} {better}"
                 ),
                 extra_markers=extra,
             )
@@ -1954,11 +2067,11 @@ def run_two_point_earthquake_demo(
                      linewidths=1.4, zorder=9, label="baseline global mean"),
             ))
 
-        _mollweide_ax(
+        _plot_ax(
             all_trial_means,
             title_str=(
                 f"Global view — {sensor_desc}\n"
-                f"KDE of all {S}×{T} DPnP trial means | "
+                f"{'KDE' if show_kde else 'Scatter'} of all {S}×{T} DPnP trial means | "
                 f"global {ylabel}={score_global:.4f} {better}"
             ),
             extra_markers=extra_global,
