@@ -1854,7 +1854,7 @@ def run_two_point_earthquake_demo(
     ]
 
     def _mollweide_ax(samples_3d, title_str, *, extra_markers=None):
-        """Draw a Mollweide projection with optional KDE or raw scatter."""
+        """Draw a Mollweide projection with optional KDE contour."""
         samp = normalize_torch(samples_3d.detach().cpu())
 
         fig, ax = plt.subplots(1, 1, figsize=(11, 5.5),
@@ -1868,10 +1868,6 @@ def run_two_point_earthquake_demo(
             cf = ax.contourf(Lon.cpu().numpy(), Lat.cpu().numpy(), dens_np,
                              levels=20, cmap="viridis")
             fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
-        else:
-            ll_samp = extrinsic_to_mollweide_rad_torch(samp).numpy()
-            ax.scatter(ll_samp[:, 1], ll_samp[:, 0],
-                       s=5, alpha=0.35, color="tab:blue", label="particles", zorder=3)
 
         # x_true
         ll_x = extrinsic_to_mollweide_rad_torch(x_true.cpu()[None]).numpy()[0]
@@ -1923,13 +1919,10 @@ def run_two_point_earthquake_demo(
             ax.plot_surface(Xs, Ys, Zs, facecolors=facecolors,
                             alpha=0.65, linewidth=0, antialiased=True)
         else:
-            # Light wireframe
-            ax.plot_wireframe(Xs, Ys, Zs, color="lightgray",
-                              alpha=0.25, linewidth=0.3,
+            # Visible wireframe so the sphere shape reads clearly
+            ax.plot_wireframe(Xs, Ys, Zs, color="steelblue",
+                              alpha=0.55, linewidth=0.6,
                               rstride=4, cstride=4)
-            # Scatter raw samples
-            ax.scatter(samp_np[:, 0], samp_np[:, 1], samp_np[:, 2],
-                       s=5, alpha=0.4, color="tab:blue", label="particles")
 
         # x_true
         xt_np = x_true.cpu().numpy()
@@ -1975,10 +1968,11 @@ def run_two_point_earthquake_demo(
             y2s = y2_sensors[s].cpu()
             xr_s = x_reflected[s].cpu()                # reflection (3,)
 
+            dpnp_trial_color = "white" if show_kde else "tab:cyan"
             extra = [
                 # per-trial mean markers (DPnP)
                 (trial_means_s,
-                 dict(s=20, color="white", alpha=0.7, edgecolors="none",
+                 dict(s=20, color=dpnp_trial_color, alpha=0.7, edgecolors="none",
                       zorder=6, label=f"DPnP trial means (T={T})")),
                 # sensor-pair mean (DPnP)
                 (sensor_mean_s[None],
