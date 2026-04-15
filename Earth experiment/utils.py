@@ -759,4 +759,130 @@ def mollweide_plot_grid_xyz_torch(
     return Lon_plot, Lat_plot, grid_xyz
 
 
+# ============================================================
+# Batched Metropolis-Hastings sampler on S^2
+# ============================================================
+
+@torch.no_grad()
+def mcmc_mh_s2_batched(
+    log_target_fn,
+    B: int,
+    n_samples: int,
+    kappa_prop: float = 30.0,
+    n_burnin: int = 500,
+    device="cpu",
+    dtype=torch.float32,
+    seed: int = 0,
+) -> torch.Tensor:
+    """
+    Batched Metropolis-Hastings sampler on S^2 using vMF proposals.
+
+    Runs B independent chains in parallel.  No score network required —
+    samples directly from the unnormalised target density.
+
+    The vMF proposal q(x' | x) = vMF(x', μ=x, κ) is symmetric on S^2
+    (since <x',x> = <x,x'>), so the MH acceptance ratio reduces to
+    min(1, π(x')/π(x)) = min(1, exp(log π(x') − log π(x))).
+
+    Parameters
+    ----------
+    log_target_fn : callable
+        log_target_fn(x) where x has shape (B, 3) → (B,) log-probabilities.
+        Need not be normalised; only differences matter.
+    B             : int   -- number of independent chains
+    n_samples     : int   -- samples to keep per chain (after burn-in)
+    kappa_prop    : float -- vMF proposal concentration (higher → smaller steps)
+    n_burnin      : int   -- burn-in steps discarded before recording
+    device, dtype, seed
+
+    Returns
+    -------
+    samples : (n_samples, B, 3) tensor on S^2
+    accept_rate : float   -- mean acceptance rate over all steps and chains
+    """
+    device = torch.device(device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+
+    # Initialise chains uniformly on S^2
+    x = normalize_torch(
+        torch.randn(B, 3, device=device, dtype=dtype, generator=gen)
+    )
+    log_q = log_target_fn(x)          # (B,)
+
+    samples = torch.empty(n_samples, B, 3, device=device, dtype=dtype)
+    n_total  = n_burnin + n_samples
+    accepted_total = 0.0
+
+    for step in range(n_total):
+        # ── vMF proposal (symmetric on S^2) ─────────────────────────────
+        x_prop = sample_vmf_s2(mu=x, kappa=kappa_prop, generator=gen)  # (B, 3)
+        log_q_prop = log_target_fn(x_prop)                              # (B,)
+
+        # ── Acceptance ───────────────────────────────────────────────────
+        log_alpha = (log_q_prop - log_q).clamp(max=0.0)                 # (B,)
+        u = torch.rand(B, device=device, dtype=dtype, generator=gen)
+        accept = u < log_alpha.exp()                                     # (B,) bool
+
+        x    = torch.where(accept.unsqueeze(-1), x_prop, x)
+        log_q = torch.where(accept, log_q_prop, log_q)
+
+        accepted_total += accept.float().mean().item()
+
+        if step >= n_burnin:
+            samples[step - n_burnin] = x
+
+    accept_rate = accepted_total / n_total
+    return samples, accept_rate
+
+
+def get_two_point_seismic_log_target(
+    y1: torch.Tensor,
+    y2: torch.Tensor,
+    u1_obs: torch.Tensor,
+    u2_obs: torch.Tensor,
+    beta: float,
+    sigma2: float,
+):
+    """
+    Batched log-target for the two-point seismic likelihood baseline.
+
+        log q(x_b) = log p(u1_b | x_b, y1_b) + log p(u2_b | x_b, y2_b)
+                   = -(u1_b - I(x_b,y1_b))^2/(2σ²)
+                     -(u2_b - I(x_b,y2_b))^2/(2σ²)
+
+    Parameters
+    ----------
+    y1, y2    : (B, 3) sensor locations (one per chain)
+    u1_obs, u2_obs : (B,) scalar observations (one per chain)
+    beta, sigma2   : seismic model parameters
+
+    Returns
+    -------
+    log_target_fn : callable  (B, 3) → (B,)
+    """
+    _y1  = y1.detach().clone()
+    _y2  = y2.detach().clone()
+    _u1  = u1_obs.detach().clone()
+    _u2  = u2_obs.detach().clone()
+
+    def log_target_fn(x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3)
+        y1_d = _y1.to(device=x.device, dtype=x.dtype)
+        y2_d = _y2.to(device=x.device, dtype=x.dtype)
+        u1_d = _u1.to(device=x.device, dtype=x.dtype)
+        u2_d = _u2.to(device=x.device, dtype=x.dtype)
+
+        x_n = normalize_torch(x)
+        ip1 = (x_n * normalize_torch(y1_d)).sum(dim=-1)   # (B,)
+        ip2 = (x_n * normalize_torch(y2_d)).sum(dim=-1)
+
+        I1 = torch.exp(beta * (ip1 - 1.0))
+        I2 = torch.exp(beta * (ip2 - 1.0))
+
+        ll1 = -(u1_d - I1) ** 2 / (2.0 * sigma2)
+        ll2 = -(u2_d - I2) ** 2 / (2.0 * sigma2)
+        return ll1 + ll2
+
+    return log_target_fn
 

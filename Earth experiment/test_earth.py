@@ -28,6 +28,8 @@ from utils import (
     seismic_signal,
     get_seismic_f_fn,
     get_two_point_seismic_f_fn,
+    mcmc_mh_s2_batched,
+    get_two_point_seismic_log_target,
 )
 
 
@@ -1226,6 +1228,9 @@ def cosine_similarity_vs_steps_two_point(
     num_pairs: int = 64,
     batch_eval_size: int = 8,
     include_baseline: bool = True,
+    baseline_method: str = "mcmc",
+    mcmc_kappa_prop: float = 50.0,
+    mcmc_n_burnin: int = 500,
     device="mps",
     dtype=torch.float32,
     seed: int = 0,
@@ -1264,9 +1269,12 @@ def cosine_similarity_vs_steps_two_point(
     num_pairs     : number of (x_true, u1, u2) triples to average over
     batch_eval_size : how many triples to batch into one DPnP call
     include_baseline : bool (default True)
-                    Also run DPnP with a flat (zero) prior — baseline that
-                    samples from q(x) ∝ p(u1|x,y1) p(u2|x,y2).  Overlaid
-                    as dashed curves on the quality-vs-step plot.
+                    Also sample from q(x) ∝ p(u1|x,y1) p(u2|x,y2) without
+                    the learned prior.  Overlaid as dashed curves on the plot.
+    baseline_method : "mcmc" (default) or "zero_prior"
+                    "mcmc"       — Metropolis-Hastings on S² (no DPnP).
+                    "zero_prior" — DPnP with p_score ≡ 0.
+    mcmc_kappa_prop, mcmc_n_burnin : MCMC tuning (used when baseline_method="mcmc").
     seed          : random seed
 
     Returns
@@ -1306,9 +1314,13 @@ def cosine_similarity_vs_steps_two_point(
         seed=seed,
     )
 
+    if include_baseline and baseline_method not in {"mcmc", "zero_prior"}:
+        raise ValueError("baseline_method must be 'mcmc' or 'zero_prior'")
+
     score_chunks_by_N    = {N: [] for N in particle_counts}
     score_chunks_by_N_bl = {N: [] for N in particle_counts} if include_baseline else {}
-    _zero_p = (lambda x, t: torch.zeros_like(x)) if include_baseline else None
+    _zero_p = (lambda x, t: torch.zeros_like(x)) if (include_baseline and baseline_method == "zero_prior") else None
+    _bl_has_steps_cs = (baseline_method == "zero_prior")
     running_seed = seed
 
     for start in range(0, num_pairs, batch_eval_size):
@@ -1357,18 +1369,37 @@ def cosine_similarity_vs_steps_two_point(
         )   # (STEPS+1, B, P, 3)
 
         if include_baseline:
-            X_steps_bl = dPnP_sampler_torch_batched(
-                q_score=q_score_fn,
-                p_score=_zero_p,
-                y=dummy_y,
-                out_samples=out_samples,
-                eta=eta,
-                grw_steps=grw_steps,
-                seed=running_seed + 99991,
-                end_only=False,
-                device=device,
-                dtype=dtype,
-            )   # (STEPS+1, B, P, 3)
+            if baseline_method == "zero_prior":
+                X_steps_bl = dPnP_sampler_torch_batched(
+                    q_score=q_score_fn,
+                    p_score=_zero_p,
+                    y=dummy_y,
+                    out_samples=out_samples,
+                    eta=eta,
+                    grw_steps=grw_steps,
+                    seed=running_seed + 99991,
+                    end_only=False,
+                    device=device,
+                    dtype=dtype,
+                )   # (STEPS+1, B, P, 3)
+                X_final_bl = X_steps_bl[-1]                      # (B, P, 3)
+            else:  # mcmc
+                log_tgt = get_two_point_seismic_log_target(
+                    y1_b if kappa_sensors is not None else y1.unsqueeze(0).expand(B, 3),
+                    y2_b if kappa_sensors is not None else y2.unsqueeze(0).expand(B, 3),
+                    u1_batch, u2_batch, beta, sigma2,
+                )
+                X_mcmc_bl, _ = mcmc_mh_s2_batched(
+                    log_target_fn=log_tgt,
+                    B=B,
+                    n_samples=out_samples,
+                    kappa_prop=mcmc_kappa_prop,
+                    n_burnin=mcmc_n_burnin,
+                    device=device,
+                    dtype=dtype,
+                    seed=running_seed + 1,
+                )   # (out_samples, B, 3)
+                X_final_bl = X_mcmc_bl.permute(1, 0, 2)         # (B, out_samples, 3)
 
         running_seed += 1
 
@@ -1380,9 +1411,9 @@ def cosine_similarity_vs_steps_two_point(
             sc = _reconstruction_score(X_sub_mean, x_batch[None], metric)  # (STEPS+1, B)
             score_chunks_by_N[N].append(sc.cpu())
             if include_baseline:
-                X_sub_bl = X_steps_bl[:, :, :N, :]
-                X_sub_mean_bl = sphere_mean_torch(X_sub_bl, dim=2)
-                sc_bl = _reconstruction_score(X_sub_mean_bl, x_batch[None], metric)
+                X_sub_bl = X_final_bl[:, :N, :]                  # (B, N, 3)
+                X_sub_mean_bl = sphere_mean_torch(X_sub_bl, dim=1)# (B, 3)
+                sc_bl = _reconstruction_score(X_sub_mean_bl, x_batch, metric)  # (B,)
                 score_chunks_by_N_bl[N].append(sc_bl.cpu())
 
     all_scores_by_N = {
@@ -1396,42 +1427,50 @@ def cosine_similarity_vs_steps_two_point(
         for N in particle_counts
     }
 
+    # Aggregate baseline chunks — shape depends on method
+    # mcmc:       score_chunks_by_N_bl[N] is list of (B,) tensors → cat → (num_pairs,)
+    # zero_prior: score_chunks_by_N_bl[N] is list of (STEPS+1, B) tensors → cat → (STEPS+1, num_pairs)
+    mean_score_by_N_bl   = {}
+    stderr_score_by_N_bl = {}
     if include_baseline:
-        all_scores_by_N_bl = {
-            N: torch.cat(score_chunks_by_N_bl[N], dim=1)
-            for N in particle_counts
-        }
-        mean_score_by_N_bl  = {N: all_scores_by_N_bl[N].mean(dim=1).numpy() for N in particle_counts}
-        stderr_score_by_N_bl = {
-            N: (all_scores_by_N_bl[N].std(dim=1, unbiased=False).numpy()
-                / np.sqrt(all_scores_by_N_bl[N].shape[1]))
-            for N in particle_counts
-        }
-    else:
-        mean_score_by_N_bl = {}
-        stderr_score_by_N_bl = {}
+        for N in particle_counts:
+            chunks = score_chunks_by_N_bl[N]
+            if _bl_has_steps_cs:
+                cat_bl = torch.cat(chunks, dim=1)       # (STEPS+1, num_pairs)
+                mean_score_by_N_bl[N]   = cat_bl.mean(dim=1).numpy()
+                stderr_score_by_N_bl[N] = (cat_bl.std(dim=1, unbiased=False).numpy()
+                                           / np.sqrt(cat_bl.shape[1]))
+            else:
+                cat_bl = torch.cat(chunks, dim=0)       # (num_pairs,)
+                mean_score_by_N_bl[N]   = float(cat_bl.mean())
+                stderr_score_by_N_bl[N] = float(cat_bl.std(unbiased=False)
+                                                 / np.sqrt(cat_bl.shape[0]))
 
     steps = np.arange(S_plus_1)
     ylabel = "mean cosine similarity" if metric == "cosine" else "mean geodesic distance (°)"
     better = "↑ better" if metric == "cosine" else "↓ better"
+    bl_label = ("MCMC baseline" if baseline_method == "mcmc" else "zero-prior baseline") if include_baseline else ""
 
     # ---- summary print ----
     print("DPnP:")
     for N in particle_counts:
-        final = mean_score_by_N[N][-1]
-        print(f"  N = {N:>3d} | final step mean {metric} = {final:.4f}")
+        print(f"  N = {N:>3d} | final step mean {metric} = {mean_score_by_N[N][-1]:.4f}")
     if include_baseline:
-        print("Baseline (likelihood-only):")
+        print(f"{bl_label}:")
         for N in particle_counts:
-            final_bl = mean_score_by_N_bl[N][-1]
-            print(f"  N = {N:>3d} | final step mean {metric} = {final_bl:.4f}")
+            v = mean_score_by_N_bl[N]
+            final = float(v[-1]) if hasattr(v, "__len__") else float(v)
+            print(f"  N = {N:>3d} | mean {metric} = {final:.4f}")
 
     # ---- plot ----
     sensor_desc = (f"vMF sensors kappa={kappa_sensors}" if kappa_sensors is not None
                    else "fixed sensors")
-    all_vals = list(mean_score_by_N.values()) + list(mean_score_by_N_bl.values())
-    ymin = min(float(v.min()) for v in all_vals)
-    ymax = max(float(v.max()) for v in all_vals)
+    bl_flat = []
+    for v in mean_score_by_N_bl.values():
+        bl_flat += list(v) if hasattr(v, "__len__") else [float(v)]
+    all_flat = [float(x) for arr in mean_score_by_N.values() for x in arr] + bl_flat
+    ymin = min(all_flat)
+    ymax = max(all_flat)
     pad = 0.05 * max(1e-8, ymax - ymin)
 
     prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -1446,21 +1485,31 @@ def cosine_similarity_vs_steps_two_point(
                              mean_score_by_N[N] + stderr_score_by_N[N],
                              alpha=0.12, color=col)
         if N in mean_score_by_N_bl:
-            plt.plot(steps, mean_score_by_N_bl[N], marker="s", linewidth=1.5,
-                     linestyle="--", color=col, alpha=0.65,
-                     label=f"baseline N={N}")
-            if show_stderr:
-                plt.fill_between(steps,
-                                 mean_score_by_N_bl[N] - stderr_score_by_N_bl[N],
-                                 mean_score_by_N_bl[N] + stderr_score_by_N_bl[N],
-                                 alpha=0.07, color=col)
+            v_bl = mean_score_by_N_bl[N]
+            e_bl = stderr_score_by_N_bl[N]
+            if _bl_has_steps_cs:
+                # zero_prior: per-step dashed curve
+                plt.plot(steps, v_bl, marker="s", linewidth=1.5,
+                         linestyle="--", color=col, alpha=0.65,
+                         label=f"{bl_label} N={N}")
+                if show_stderr:
+                    plt.fill_between(steps, v_bl - e_bl, v_bl + e_bl,
+                                     alpha=0.07, color=col)
+            else:
+                # mcmc: horizontal dashed line
+                plt.axhline(v_bl, color=col, linestyle="--",
+                            linewidth=1.5, alpha=0.65,
+                            label=f"{bl_label} N={N}")
+                if show_stderr:
+                    plt.axhspan(v_bl - e_bl, v_bl + e_bl,
+                                alpha=0.06, color=col)
 
     plt.xlabel("DPnP step")
     plt.ylabel(f"{ylabel}  ({better})")
     plt.title(
         f"Two-point seismic: {ylabel} vs DPnP step\n"
         f"{sensor_desc}, spherical mean over N particles"
-        + (" | dashed = likelihood-only baseline" if include_baseline else "")
+        + (f" | dashed = {bl_label}" if include_baseline and bl_label else "")
     )
     plt.ylim(ymin - pad, ymax + pad)
     plt.grid(alpha=0.25)
@@ -1512,6 +1561,9 @@ def run_two_point_earthquake_demo(
     plot_global: bool = True,
     plot_quality_vs_steps: bool = True,
     include_baseline: bool = True,
+    baseline_method: str = "mcmc",
+    mcmc_kappa_prop: float = 50.0,
+    mcmc_n_burnin: int = 500,
     device="mps",
     dtype=torch.float32,
     seed: int = 0,
@@ -1562,11 +1614,20 @@ def run_two_point_earthquake_demo(
     plot_quality_vs_steps : bool (default True)
                           Quality metric vs DPnP step, averaged over all S*T.
     include_baseline    : bool (default True)
-                          If True, run a second DPnP pass with a flat (zero)
-                          prior score, sampling from
+                          If True, also sample from
                             q(x) ∝ p(u1|x,y1) p(u2|x,y2)
-                          without any learned earthquake prior.  Baseline
-                          curves are overlaid on the quality-vs-step plot.
+                          without any learned earthquake prior, and overlay
+                          results on the quality-vs-step plot.
+    baseline_method     : "mcmc" (default) or "zero_prior"
+                          "mcmc"       — Metropolis-Hastings on S² with vMF
+                                         proposals; no DPnP involved.
+                          "zero_prior" — DPnP with p_score set to zero;
+                                         gives a per-step curve.
+    mcmc_kappa_prop     : float (default 50.0)
+                          vMF proposal concentration for MCMC.
+                          Only used when baseline_method="mcmc".
+    mcmc_n_burnin       : int (default 500)
+                          Burn-in steps for MCMC baseline.
     seed                : base random seed
 
     Returns
@@ -1719,49 +1780,84 @@ def run_two_point_earthquake_demo(
         )   # (STEPS+1, S*T)
         score_steps_by_N[N] = sc.reshape(STEPS + 1, S, T).cpu()     # (STEPS+1, S, T)
 
-    # ── 6b. Baseline: DPnP with flat (zero) prior ─────────────────────────────
-    # Samples from q(x) ∝ p(u1|x,y1) p(u2|x,y2) without the learned prior.
-    X_finals_bl = None
-    trial_means_bl = None
-    score_trials_bl = None
-    score_global_bl = None
-    score_steps_by_N_bl = {}
-    if include_baseline:
-        print("\nRunning likelihood-only baseline (zero prior score)…")
-        _zero_p = lambda x, t: torch.zeros_like(x)
-        X_steps_bl = dPnP_sampler_torch_batched(
-            q_score=q_score,
-            p_score=_zero_p,
-            y=y1_flat,
-            out_samples=P,
-            eta=eta_t,
-            grw_steps=grw_steps,
-            seed=seed + 99991,   # different seed to decorrelate
-            end_only=False,
-            device=device,
-            dtype=dtype,
-        )   # (STEPS+1, S*T, P, 3)
+    # ── 6b. Baseline: likelihood-only sampling ────────────────────────────────
+    if include_baseline and baseline_method not in {"mcmc", "zero_prior"}:
+        raise ValueError("baseline_method must be 'mcmc' or 'zero_prior'")
 
-        X_finals_bl    = X_steps_bl[-1].reshape(S, T, P, 3)
-        trial_means_bl = sphere_mean_torch(X_finals_bl, dim=2)           # (S, T, 3)
+    X_finals_bl      = None
+    trial_means_bl   = None
+    score_trials_bl  = None
+    score_global_bl  = None
+    score_steps_by_N_bl = {}
+    _bl_has_steps    = False   # True when baseline produces a per-step trace
+
+    if include_baseline:
+        if baseline_method == "mcmc":
+            # ── MCMC on S² (no DPnP, no score network) ──────────────────────
+            print("\nRunning likelihood-only baseline (MCMC on S²)…")
+            log_target = get_two_point_seismic_log_target(
+                y1_flat, y2_flat, u1_flat, u2_flat, beta, sigma2
+            )
+            # P samples per chain, S*T independent chains
+            X_mcmc, accept_rate = mcmc_mh_s2_batched(
+                log_target_fn=log_target,
+                B=S * T,
+                n_samples=P,
+                kappa_prop=mcmc_kappa_prop,
+                n_burnin=mcmc_n_burnin,
+                device=device,
+                dtype=dtype,
+                seed=seed + 1,
+            )   # (P, S*T, 3)
+            print(f"  MCMC acceptance rate: {accept_rate:.3f}")
+            X_finals_bl = X_mcmc.permute(1, 0, 2).reshape(S, T, P, 3)   # (S, T, P, 3)
+            _bl_has_steps = False
+
+        else:  # baseline_method == "zero_prior"
+            # ── DPnP with p_score ≡ 0 ───────────────────────────────────────
+            print("\nRunning likelihood-only baseline (DPnP, zero prior score)…")
+            _zero_p = lambda x, t: torch.zeros_like(x)
+            X_steps_bl = dPnP_sampler_torch_batched(
+                q_score=q_score,
+                p_score=_zero_p,
+                y=y1_flat,
+                out_samples=P,
+                eta=eta_t,
+                grw_steps=grw_steps,
+                seed=seed + 99991,
+                end_only=False,
+                device=device,
+                dtype=dtype,
+            )   # (STEPS+1, S*T, P, 3)
+            X_finals_bl   = X_steps_bl[-1].reshape(S, T, P, 3)
+            _bl_has_steps = True
+
+        trial_means_bl  = sphere_mean_torch(X_finals_bl, dim=2)           # (S, T, 3)
         score_trials_bl = _reconstruction_score(trial_means_bl, xt_ST, metric)  # (S, T)
         score_global_bl = _reconstruction_score(
             sphere_mean_torch(trial_means_bl.reshape(S * T, 3), dim=0)[None],
-            x_true[None], metric
+            x_true[None], metric,
         ).item()
         print(f"Baseline trial {ylabel}: mean={score_trials_bl.mean():.4f}  "
               f"std={score_trials_bl.std():.4f}  {better}")
         print(f"Baseline global {ylabel}: {score_global_bl:.4f}")
 
         for N in particle_counts:
-            X_sub_bl      = X_steps_bl[:, :, :N, :]
-            X_sub_mean_bl = sphere_mean_torch(X_sub_bl, dim=2)
-            sc_bl = _reconstruction_score(
-                X_sub_mean_bl,
-                x_true.expand(S * T, 3)[None].expand(STEPS + 1, S * T, 3),
-                metric,
-            )
-            score_steps_by_N_bl[N] = sc_bl.reshape(STEPS + 1, S, T).cpu()
+            X_sub_bl      = X_finals_bl[:, :, :N, :]              # (S, T, N, 3)
+            X_sub_mean_bl = sphere_mean_torch(X_sub_bl, dim=2)    # (S, T, 3)
+            sc_bl = _reconstruction_score(X_sub_mean_bl, xt_ST, metric)  # (S, T)
+            if _bl_has_steps:
+                # zero_prior: also store per-step trace
+                X_sub_steps_bl = X_steps_bl[:, :, :N, :]
+                X_sm_steps_bl  = sphere_mean_torch(X_sub_steps_bl, dim=2)
+                sc_steps_bl = _reconstruction_score(
+                    X_sm_steps_bl,
+                    x_true.expand(S * T, 3)[None].expand(STEPS + 1, S * T, 3),
+                    metric,
+                )
+                score_steps_by_N_bl[N] = sc_steps_bl.reshape(STEPS + 1, S, T).cpu()
+            else:
+                score_steps_by_N_bl[N] = sc_bl.cpu()              # (S, T)
 
     # ── 7. Plot helpers ───────────────────────────────────────────────────────
     _lon_ax_labels = [
@@ -1909,8 +2005,8 @@ def run_two_point_earthquake_demo(
 
     # ── 10. Quality vs DPnP steps ─────────────────────────────────────────────
     if plot_quality_vs_steps:
-        steps_arr   = np.arange(STEPS + 1)
-        n_total     = S * T
+        steps_arr = np.arange(STEPS + 1)
+        n_total   = S * T
         mean_sc_N   = {N: score_steps_by_N[N].mean(dim=(1, 2)).numpy() for N in particle_counts}
         stderr_sc_N = {
             N: score_steps_by_N[N].reshape(STEPS + 1, n_total).std(dim=1, unbiased=False).numpy()
@@ -1918,21 +2014,35 @@ def run_two_point_earthquake_demo(
             for N in particle_counts
         }
 
-        all_vals = list(mean_sc_N.values())
+        # Baseline: MCMC → horizontal line per N; zero_prior → per-step curve
+        mean_bl_N   = {}
+        stderr_bl_N = {}
+        mean_bl_steps_N   = {}
+        stderr_bl_steps_N = {}
+        bl_label = ""
         if include_baseline and score_steps_by_N_bl:
-            mean_sc_N_bl   = {N: score_steps_by_N_bl[N].mean(dim=(1, 2)).numpy() for N in particle_counts}
-            stderr_sc_N_bl = {
-                N: score_steps_by_N_bl[N].reshape(STEPS + 1, n_total).std(dim=1, unbiased=False).numpy()
-                   / np.sqrt(n_total)
-                for N in particle_counts
-            }
-            all_vals += list(mean_sc_N_bl.values())
-        else:
-            mean_sc_N_bl = {}
-            stderr_sc_N_bl = {}
+            bl_label = "MCMC baseline" if baseline_method == "mcmc" else "zero-prior baseline"
+            if _bl_has_steps:
+                # zero_prior: per-step array (STEPS+1, S, T)
+                mean_bl_steps_N   = {N: score_steps_by_N_bl[N].mean(dim=(1, 2)).numpy()
+                                     for N in particle_counts}
+                stderr_bl_steps_N = {
+                    N: score_steps_by_N_bl[N].reshape(STEPS + 1, n_total)
+                         .std(dim=1, unbiased=False).numpy() / np.sqrt(n_total)
+                    for N in particle_counts
+                }
+            else:
+                # mcmc: scalar (S, T)
+                mean_bl_N   = {N: float(score_steps_by_N_bl[N].mean())
+                               for N in particle_counts}
+                stderr_bl_N = {N: float(score_steps_by_N_bl[N].std() / np.sqrt(n_total))
+                               for N in particle_counts}
 
-        ymin = min(float(v.min()) for v in all_vals)
-        ymax = max(float(v.max()) for v in all_vals)
+        bl_flat = (list(mean_bl_N.values()) if mean_bl_N else
+                   [float(v) for arr in mean_bl_steps_N.values() for v in arr])
+        all_flat = [float(v) for arr in mean_sc_N.values() for v in arr] + bl_flat
+        ymin = min(all_flat)
+        ymax = max(all_flat)
         pad  = 0.05 * max(1e-8, ymax - ymin)
 
         prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -1946,14 +2056,24 @@ def run_two_point_earthquake_demo(
                                  mean_sc_N[N] - stderr_sc_N[N],
                                  mean_sc_N[N] + stderr_sc_N[N],
                                  alpha=0.12, color=col)
-            if N in mean_sc_N_bl:
-                plt.plot(steps_arr, mean_sc_N_bl[N], marker="s", linewidth=1.5,
-                         linestyle="--", color=col, alpha=0.65,
-                         label=f"baseline N={N}")
+            if N in mean_bl_N:
+                # Horizontal dashed line (MCMC has no step axis)
+                plt.axhline(mean_bl_N[N], color=col, linestyle="--",
+                            linewidth=1.5, alpha=0.65,
+                            label=f"{bl_label} N={N}")
+                if show_stderr:
+                    plt.axhspan(mean_bl_N[N] - stderr_bl_N[N],
+                                mean_bl_N[N] + stderr_bl_N[N],
+                                alpha=0.06, color=col)
+            if N in mean_bl_steps_N:
+                # Per-step dashed curve (zero_prior)
+                plt.plot(steps_arr, mean_bl_steps_N[N], marker="s",
+                         linewidth=1.5, linestyle="--", color=col, alpha=0.65,
+                         label=f"{bl_label} N={N}")
                 if show_stderr:
                     plt.fill_between(steps_arr,
-                                     mean_sc_N_bl[N] - stderr_sc_N_bl[N],
-                                     mean_sc_N_bl[N] + stderr_sc_N_bl[N],
+                                     mean_bl_steps_N[N] - stderr_bl_steps_N[N],
+                                     mean_bl_steps_N[N] + stderr_bl_steps_N[N],
                                      alpha=0.07, color=col)
 
         plt.xlabel("DPnP step")
@@ -1961,7 +2081,7 @@ def run_two_point_earthquake_demo(
         plt.title(
             f"Two-point seismic: {ylabel} vs DPnP step\n"
             f"{sensor_desc}, averaged over {S}×{T} trials"
-            + (" | dashed = likelihood-only baseline" if include_baseline else "")
+            + (f" | dashed = {bl_label}" if include_baseline and bl_label else "")
         )
         plt.ylim(ymin - pad, ymax + pad)
         plt.grid(alpha=0.25)
