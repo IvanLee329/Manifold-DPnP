@@ -1175,6 +1175,38 @@ def _reconstruction_score(x_recon: torch.Tensor, x_true: torch.Tensor, metric: s
         raise ValueError(f"metric must be 'cosine' or 'geodesic', got '{metric}'")
 
 
+def _reflect_through_great_circle(
+    x: torch.Tensor,
+    y1: torch.Tensor,
+    y2: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Reflect x through the great circle spanned by y1 and y2.
+
+    The two-point seismic likelihood I(x,y_i) = exp(β(<x,y_i>−1)) depends on
+    x only through its inner products with y1 and y2.  Hence any x that
+    satisfies <x,y1>=<x_true,y1> AND <x,y2>=<x_true,y2> is observationally
+    *identical* to x_true from both sensors.  The unique other such point on
+    S² is the reflection of x_true through the plane span(y1,y2):
+
+        x' = x − 2 (x · n) n,  n = normalize(y1 × y2).
+
+    Parameters
+    ----------
+    x  : (..., 3)
+    y1 : (3,) or (S, 3) -- broadcast-compatible with x
+    y2 : (3,) or (S, 3)
+
+    Returns
+    -------
+    x' : (..., 3), normalised onto S^2.  Equals x when x lies in span(y1,y2).
+    """
+    cross = torch.linalg.cross(y1, y2, dim=-1)                 # (..., 3)
+    n = cross / cross.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+    proj = (x * n).sum(dim=-1, keepdim=True)                   # (..., 1)
+    return normalize_torch(x - 2.0 * proj * n)
+
+
 @torch.no_grad()
 def cosine_similarity_vs_steps_two_point(
     dataloader,
@@ -1193,6 +1225,7 @@ def cosine_similarity_vs_steps_two_point(
     grw_steps: int = 5,
     num_pairs: int = 64,
     batch_eval_size: int = 8,
+    include_baseline: bool = True,
     device="mps",
     dtype=torch.float32,
     seed: int = 0,
@@ -1230,13 +1263,18 @@ def cosine_similarity_vs_steps_two_point(
     grw_steps     : SDE integration steps per DPnP step
     num_pairs     : number of (x_true, u1, u2) triples to average over
     batch_eval_size : how many triples to batch into one DPnP call
+    include_baseline : bool (default True)
+                    Also run DPnP with a flat (zero) prior — baseline that
+                    samples from q(x) ∝ p(u1|x,y1) p(u2|x,y2).  Overlaid
+                    as dashed curves on the quality-vs-step plot.
     seed          : random seed
 
     Returns
     -------
     dict with keys:
         "steps", "metric",
-        "by_particle_count": {N: {"mean_score", "stderr_score"}}
+        "by_particle_count": {N: {"mean_score", "stderr_score"}},
+        "baseline_by_particle_count": {N: {"mean_score", "stderr_score"}}   # if include_baseline
     """
     if kappa_sensors is None and (y1 is None or y2 is None):
         raise ValueError("Provide y1 and y2, or set kappa_sensors to sample them per x_true.")
@@ -1268,7 +1306,9 @@ def cosine_similarity_vs_steps_two_point(
         seed=seed,
     )
 
-    score_chunks_by_N = {N: [] for N in particle_counts}
+    score_chunks_by_N    = {N: [] for N in particle_counts}
+    score_chunks_by_N_bl = {N: [] for N in particle_counts} if include_baseline else {}
+    _zero_p = (lambda x, t: torch.zeros_like(x)) if include_baseline else None
     running_seed = seed
 
     for start in range(0, num_pairs, batch_eval_size):
@@ -1297,14 +1337,14 @@ def cosine_similarity_vs_steps_two_point(
 
         # ---- DPnP with batched f_fn ----
         f_fn = get_two_point_seismic_f_fn(y1_b, y2_b, u1_batch, u2_batch, beta, sigma2)
-        q_score = get_bel(f_fn=f_fn, n_paths=n_bel_paths, n_steps=n_bel_steps,
-                          device=device, dtype=dtype)
+        q_score_fn = get_bel(f_fn=f_fn, n_paths=n_bel_paths, n_steps=n_bel_steps,
+                             device=device, dtype=dtype)
 
         # Dummy y sets B; use y1_b (per-item) or broadcast y1
         dummy_y = y1_b if kappa_sensors is not None else y1.unsqueeze(0).expand(B, 3)
 
         X_steps = dPnP_sampler_torch_batched(
-            q_score=q_score,
+            q_score=q_score_fn,
             p_score=p_score,
             y=dummy_y,
             out_samples=out_samples,
@@ -1314,19 +1354,39 @@ def cosine_similarity_vs_steps_two_point(
             end_only=False,
             device=device,
             dtype=dtype,
-        )   # (S+1, B, P, 3)
+        )   # (STEPS+1, B, P, 3)
+
+        if include_baseline:
+            X_steps_bl = dPnP_sampler_torch_batched(
+                q_score=q_score_fn,
+                p_score=_zero_p,
+                y=dummy_y,
+                out_samples=out_samples,
+                eta=eta,
+                grw_steps=grw_steps,
+                seed=running_seed + 99991,
+                end_only=False,
+                device=device,
+                dtype=dtype,
+            )   # (STEPS+1, B, P, 3)
+
         running_seed += 1
 
         S_plus_1 = X_steps.shape[0]
 
         for N in particle_counts:
-            X_sub = X_steps[:, :, :N, :]                       # (S+1, B, N, 3)
-            X_sub_mean = sphere_mean_torch(X_sub, dim=2)        # (S+1, B, 3)
-            sc = _reconstruction_score(X_sub_mean, x_batch[None], metric)  # (S+1, B)
+            X_sub = X_steps[:, :, :N, :]                        # (STEPS+1, B, N, 3)
+            X_sub_mean = sphere_mean_torch(X_sub, dim=2)         # (STEPS+1, B, 3)
+            sc = _reconstruction_score(X_sub_mean, x_batch[None], metric)  # (STEPS+1, B)
             score_chunks_by_N[N].append(sc.cpu())
+            if include_baseline:
+                X_sub_bl = X_steps_bl[:, :, :N, :]
+                X_sub_mean_bl = sphere_mean_torch(X_sub_bl, dim=2)
+                sc_bl = _reconstruction_score(X_sub_mean_bl, x_batch[None], metric)
+                score_chunks_by_N_bl[N].append(sc_bl.cpu())
 
     all_scores_by_N = {
-        N: torch.cat(score_chunks_by_N[N], dim=1)   # (S+1, num_pairs)
+        N: torch.cat(score_chunks_by_N[N], dim=1)   # (STEPS+1, num_pairs)
         for N in particle_counts
     }
     mean_score_by_N  = {N: all_scores_by_N[N].mean(dim=1).numpy()  for N in particle_counts}
@@ -1336,46 +1396,79 @@ def cosine_similarity_vs_steps_two_point(
         for N in particle_counts
     }
 
+    if include_baseline:
+        all_scores_by_N_bl = {
+            N: torch.cat(score_chunks_by_N_bl[N], dim=1)
+            for N in particle_counts
+        }
+        mean_score_by_N_bl  = {N: all_scores_by_N_bl[N].mean(dim=1).numpy() for N in particle_counts}
+        stderr_score_by_N_bl = {
+            N: (all_scores_by_N_bl[N].std(dim=1, unbiased=False).numpy()
+                / np.sqrt(all_scores_by_N_bl[N].shape[1]))
+            for N in particle_counts
+        }
+    else:
+        mean_score_by_N_bl = {}
+        stderr_score_by_N_bl = {}
+
     steps = np.arange(S_plus_1)
     ylabel = "mean cosine similarity" if metric == "cosine" else "mean geodesic distance (°)"
     better = "↑ better" if metric == "cosine" else "↓ better"
 
     # ---- summary print ----
+    print("DPnP:")
     for N in particle_counts:
         final = mean_score_by_N[N][-1]
-        print(f"N = {N:>3d} | final step mean {metric} = {final:.4f}")
+        print(f"  N = {N:>3d} | final step mean {metric} = {final:.4f}")
+    if include_baseline:
+        print("Baseline (likelihood-only):")
+        for N in particle_counts:
+            final_bl = mean_score_by_N_bl[N][-1]
+            print(f"  N = {N:>3d} | final step mean {metric} = {final_bl:.4f}")
 
     # ---- plot ----
-    ymin = min(float(v.min()) for v in mean_score_by_N.values())
-    ymax = max(float(v.max()) for v in mean_score_by_N.values())
-    pad = 0.05 * max(1e-8, ymax - ymin)
-
     sensor_desc = (f"vMF sensors kappa={kappa_sensors}" if kappa_sensors is not None
                    else "fixed sensors")
+    all_vals = list(mean_score_by_N.values()) + list(mean_score_by_N_bl.values())
+    ymin = min(float(v.min()) for v in all_vals)
+    ymax = max(float(v.max()) for v in all_vals)
+    pad = 0.05 * max(1e-8, ymax - ymin)
+
+    prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     plt.figure(figsize=(8, 5))
-    for N in particle_counts:
-        plt.plot(steps, mean_score_by_N[N], marker="o", linewidth=2, label=f"N = {N}")
+    for i, N in enumerate(particle_counts):
+        col = prop_cycle[i % len(prop_cycle)]
+        plt.plot(steps, mean_score_by_N[N], marker="o", linewidth=2,
+                 color=col, label=f"DPnP N={N}")
         if show_stderr:
-            plt.fill_between(
-                steps,
-                mean_score_by_N[N] - stderr_score_by_N[N],
-                mean_score_by_N[N] + stderr_score_by_N[N],
-                alpha=0.12,
-            )
+            plt.fill_between(steps,
+                             mean_score_by_N[N] - stderr_score_by_N[N],
+                             mean_score_by_N[N] + stderr_score_by_N[N],
+                             alpha=0.12, color=col)
+        if N in mean_score_by_N_bl:
+            plt.plot(steps, mean_score_by_N_bl[N], marker="s", linewidth=1.5,
+                     linestyle="--", color=col, alpha=0.65,
+                     label=f"baseline N={N}")
+            if show_stderr:
+                plt.fill_between(steps,
+                                 mean_score_by_N_bl[N] - stderr_score_by_N_bl[N],
+                                 mean_score_by_N_bl[N] + stderr_score_by_N_bl[N],
+                                 alpha=0.07, color=col)
 
     plt.xlabel("DPnP step")
     plt.ylabel(f"{ylabel}  ({better})")
     plt.title(
         f"Two-point seismic: {ylabel} vs DPnP step\n"
         f"{sensor_desc}, spherical mean over N particles"
+        + (" | dashed = likelihood-only baseline" if include_baseline else "")
     )
     plt.ylim(ymin - pad, ymax + pad)
     plt.grid(alpha=0.25)
-    plt.legend()
+    plt.legend(fontsize=8, ncol=2)
     plt.tight_layout()
     plt.show()
 
-    return {
+    out = {
         "steps": steps,
         "metric": metric,
         "by_particle_count": {
@@ -1383,10 +1476,17 @@ def cosine_similarity_vs_steps_two_point(
             for N in particle_counts
         },
     }
+    if include_baseline:
+        out["baseline_by_particle_count"] = {
+            N: {"mean_score": mean_score_by_N_bl[N], "stderr_score": stderr_score_by_N_bl[N]}
+            for N in particle_counts
+        }
+    return out
 
 
 # =========================================================
-# Two-point seismic demo – single x_true, multiple u samples
+# Two-point seismic demo – one x_true, multiple (y1,y2) pairs,
+#                          multiple (u1,u2) trials per sensor pair
 # =========================================================
 
 @torch.no_grad()
@@ -1398,7 +1498,8 @@ def run_two_point_earthquake_demo(
     sigma2: float = 0.05,
     p_score=None,
     eta=None,
-    n_trials: int = 20,
+    n_sensor_pairs: int = 5,
+    n_trials_per_sensor: int = 10,
     kappa_sensors: float | None = None,
     metric: str = "cosine",
     n_bel_paths: int = 5000,
@@ -1407,6 +1508,10 @@ def run_two_point_earthquake_demo(
     grw_steps: int = 5,
     particle_counts=(1, 5, 10, 20),
     kde_kappa: float = 25.0,
+    plot_per_sensor: bool = True,
+    plot_global: bool = True,
+    plot_quality_vs_steps: bool = True,
+    include_baseline: bool = True,
     device="mps",
     dtype=torch.float32,
     seed: int = 0,
@@ -1415,228 +1520,481 @@ def run_two_point_earthquake_demo(
     """
     Two-point seismic earthquake reconstruction demo.
 
-    For a known earthquake location x_true and two sensor positions y1, y2,
-    repeatedly samples scalar measurements
+    Hierarchy:
+        x_true
+        └── sensor pair s = 1 … n_sensor_pairs  (y1_s, y2_s)
+            └── u-trial  t = 1 … n_trials_per_sensor
+                └── DPnP → out_samples particles → trial_mean[s, t]
 
-        u1_k ~ N(I(x_true, y1), sigma2)
-        u2_k ~ N(I(x_true, y2), sigma2)
-        I(x, y) = exp(beta * (<x, y> - 1))
-
-    for k = 1 … n_trials and runs DPnP with the joint two-sensor likelihood as
-    q_score.
-
-    Displays:
-      1. Mollweide KDE of per-trial averaged reconstructions (with x_true and sensors).
-      2. Reconstruction quality vs DPnP step for different particle counts N.
+    All S × T trials are batched into **one** DPnP call for efficiency.
 
     Parameters
     ----------
-    x_true        : (3,) tensor -- true earthquake location on S^2
-    y1, y2        : (3,) tensors or None -- sensor locations on S^2.
-                    Required when kappa_sensors is None.
-    beta          : float -- seismic signal decay rate (beta > 0)
-    sigma2        : float -- observation noise variance
-    p_score       : callable -- trained prior score p_score(x, t)
-    eta           : 1-D array -- DPnP time schedule
-    n_trials      : int -- K, number of (u1, u2) realisations to average
-    kappa_sensors : float or None
-                    If given, sample y1, y2 ~ vMF(x_true, kappa_sensors) once
-                    instead of using provided y1, y2.
-                    Larger kappa = sensors closer to x_true.
-    metric        : "cosine" (default) or "geodesic"
-                    "cosine"   -- dot product, higher is better.
-                    "geodesic" -- great-circle distance in degrees, lower is better.
+    x_true              : (3,) tensor -- true earthquake location on S^2
+    y1, y2              : (3,) or (S, 3) tensors, or None.
+                          Required when kappa_sensors is None.
+                          (3,) tensors are broadcast to all S sensor pairs.
+    beta                : float -- seismic signal decay rate (beta > 0)
+    sigma2              : float -- observation noise variance
+    p_score             : callable -- trained prior score p_score(x, t)
+    eta                 : 1-D array -- DPnP time schedule
+    n_sensor_pairs      : int (S) -- number of (y1, y2) configurations
+    n_trials_per_sensor : int (T) -- number of (u1, u2) draws per sensor pair
+    kappa_sensors       : float or None
+                          Sample y1_s, y2_s ~ vMF(x_true, kappa_sensors)
+                          independently for each s.  Larger kappa → sensors
+                          closer to x_true.  When set, y1/y2 are ignored.
+    metric              : "cosine" (default) or "geodesic"
     n_bel_paths, n_bel_steps : BEL hyper-parameters
-    out_samples   : DPnP particles P per trial
-    grw_steps     : SDE integration steps per DPnP step
-    particle_counts : N values for the quality-vs-step plot
-    kde_kappa     : vMF bandwidth for the Mollweide KDE
-    seed          : base random seed
+    out_samples         : DPnP particles P per trial
+    grw_steps           : SDE integration steps per DPnP outer step
+    particle_counts     : N values for the quality-vs-step plot
+    kde_kappa           : vMF bandwidth for Mollweide KDE plots
+    plot_per_sensor     : bool (default True)
+                          One Mollweide plot per sensor pair showing the KDE
+                          of all T*P particles, the T individual trial-mean
+                          markers, the sensor-pair mean, x_true, y1/y2, and
+                          the reflection point (ambiguous likelihood partner).
+    plot_global         : bool (default True)
+                          One Mollweide plot with the KDE of all S*T trial
+                          means, one marker per sensor-pair mean, and the
+                          global mean.
+    plot_quality_vs_steps : bool (default True)
+                          Quality metric vs DPnP step, averaged over all S*T.
+    include_baseline    : bool (default True)
+                          If True, run a second DPnP pass with a flat (zero)
+                          prior score, sampling from
+                            q(x) ∝ p(u1|x,y1) p(u2|x,y2)
+                          without any learned earthquake prior.  Baseline
+                          curves are overlaid on the quality-vs-step plot.
+    seed                : base random seed
 
     Returns
     -------
-    dict with keys:
-        x_true, y1, y2,
-        u1_all (K,), u2_all (K,),
-        X_finals (K, P, 3)      -- final DPnP particles per trial
-        trial_means (K, 3)      -- per-trial spherical mean reconstruction
-        overall_mean (3,)       -- spherical mean over all trial means
-        score_trials (K,)       -- per-trial metric value for the mean reconstruction
-        score_steps_by_N        -- {N: (S+1, K) ndarray}
-        metric                  -- the metric string used
+    dict with keys
+        x_true               : (3,)
+        y1_sensors           : (S, 3)
+        y2_sensors           : (S, 3)
+        x_reflected          : (S, 3)  -- reflection of x_true through span(y1_s,y2_s)
+                                          has identical seismic likelihood as x_true
+        u1_all               : (S, T)
+        u2_all               : (S, T)
+        X_finals             : (S, T, P, 3) -- final DPnP particles
+        trial_means          : (S, T, 3)    -- spherical mean over P per trial
+        sensor_means         : (S, 3)       -- spherical mean over T per sensor pair
+        global_mean          : (3,)         -- spherical mean over all S*T trials
+        score_trials         : (S, T)       -- metric at trial_means
+        score_sensors        : (S,)         -- metric at sensor_means
+        score_global         : float        -- metric at global_mean
+        score_steps_by_N     : {N: (STEPS+1, S, T) ndarray}
+        -- if include_baseline --
+        X_finals_bl          : (S, T, P, 3) -- baseline (no prior) final particles
+        trial_means_bl       : (S, T, 3)
+        score_trials_bl      : (S, T)
+        score_global_bl      : float
+        score_steps_by_N_bl  : {N: (STEPS+1, S, T) ndarray}
+        metric               : str
     """
     if p_score is None or eta is None:
         raise ValueError("p_score and eta are required.")
     if kappa_sensors is None and (y1 is None or y2 is None):
-        raise ValueError("Provide y1 and y2, or set kappa_sensors to sample them from vMF.")
+        raise ValueError("Provide y1/y2, or set kappa_sensors to sample them from vMF.")
     if metric not in {"cosine", "geodesic"}:
         raise ValueError("metric must be 'cosine' or 'geodesic'")
 
     device = torch.device(device)
     eta_t = torch.as_tensor(eta, device=device, dtype=dtype)
-    S = int(eta_t.numel())
-    particle_counts = sorted(set(int(n) for n in particle_counts))
-    if max(particle_counts) > out_samples:
-        raise ValueError(f"max particle count {max(particle_counts)} > out_samples {out_samples}")
+    STEPS = int(eta_t.numel())
 
-    x_true = normalize_torch(torch.as_tensor(x_true, device=device, dtype=dtype))
+    x_true = normalize_torch(torch.as_tensor(x_true, device=device, dtype=dtype))  # (3,)
+    S = int(n_sensor_pairs)
+    T = int(n_trials_per_sensor)
+    P = int(out_samples)
     sigma = math.sqrt(sigma2)
+    particle_counts = sorted(set(int(n) for n in particle_counts))
+    if max(particle_counts) > P:
+        raise ValueError(f"max particle count {max(particle_counts)} > out_samples {P}")
 
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
 
-    # ---- 1. Sensor locations ----
+    # ── 1. Sensor locations (S, 3) ────────────────────────────────────────────
     if kappa_sensors is not None:
-        y1 = sample_vmf_s2(mu=x_true, kappa=kappa_sensors, generator=gen)  # (3,)
-        y2 = sample_vmf_s2(mu=x_true, kappa=kappa_sensors, generator=gen)  # (3,)
-        print(f"Sampled sensors from vMF(x_true, kappa={kappa_sensors})")
+        y1_sensors = sample_vmf_s2(mu=x_true, kappa=kappa_sensors,
+                                   n_samples=S, generator=gen)   # (S, 3)
+        y2_sensors = sample_vmf_s2(mu=x_true, kappa=kappa_sensors,
+                                   n_samples=S, generator=gen)   # (S, 3)
+        sensor_desc = f"vMF sensors (kappa={kappa_sensors})"
+        print(f"Sampled {S} sensor pairs from vMF(x_true, kappa={kappa_sensors})")
     else:
-        y1 = normalize_torch(torch.as_tensor(y1, device=device, dtype=dtype))
-        y2 = normalize_torch(torch.as_tensor(y2, device=device, dtype=dtype))
+        y1_t = normalize_torch(torch.as_tensor(y1, device=device, dtype=dtype))
+        y2_t = normalize_torch(torch.as_tensor(y2, device=device, dtype=dtype))
+        if y1_t.dim() == 1:          # (3,) → broadcast
+            y1_sensors = y1_t.unsqueeze(0).expand(S, 3).clone()
+            y2_sensors = y2_t.unsqueeze(0).expand(S, 3).clone()
+        else:                         # already (S, 3)
+            y1_sensors = y1_t
+            y2_sensors = y2_t
+        sensor_desc = "fixed sensors"
 
-    # ---- 2. Compute true signals ----
-    I1_true = seismic_signal(x_true, y1, beta).item()
-    I2_true = seismic_signal(x_true, y2, beta).item()
-    print(f"True signals:  I(x, y1) = {I1_true:.4f},  I(x, y2) = {I2_true:.4f}")
+    ylabel  = "cosine similarity" if metric == "cosine" else "geodesic distance (°)"
+    better  = "(↑ better)"        if metric == "cosine" else "(↓ better)"
 
-    # ---- 3. Sample K observations ----
-    u1_all = I1_true + sigma * torch.randn(n_trials, device=device, dtype=dtype, generator=gen)
-    u2_all = I2_true + sigma * torch.randn(n_trials, device=device, dtype=dtype, generator=gen)
-    print(f"Sampled {n_trials} (u1, u2) pairs.  "
-          f"u1 mean={u1_all.mean():.4f},  u2 mean={u2_all.mean():.4f}")
+    # ── 2. True seismic signals and noisy observations ────────────────────────
+    # I_true: (S,)  — signal at each sensor pair
+    I1_true = seismic_signal(x_true, y1_sensors, beta)   # (S,)
+    I2_true = seismic_signal(x_true, y2_sensors, beta)   # (S,)
 
-    # ---- 4. Run DPnP for all K trials in one batched call ----
-    f_fn = get_two_point_seismic_f_fn(y1, y2, u1_all, u2_all, beta, sigma2)
+    # u_all: (S, T)  — T u-draws per sensor pair
+    noise1 = torch.randn(S, T, device=device, dtype=dtype, generator=gen)
+    noise2 = torch.randn(S, T, device=device, dtype=dtype, generator=gen)
+    u1_all = I1_true[:, None] + sigma * noise1   # (S, T)
+    u2_all = I2_true[:, None] + sigma * noise2   # (S, T)
+    print(f"Sampled {S}×{T} = {S*T} (u1, u2) pairs.")
+
+    # ── 3. Batch all S×T trials into one DPnP call ───────────────────────────
+    # Flatten: item k = s*T + t  →  sensor s, trial t
+    y1_flat = y1_sensors.unsqueeze(1).expand(S, T, 3).reshape(S * T, 3)   # (S*T, 3)
+    y2_flat = y2_sensors.unsqueeze(1).expand(S, T, 3).reshape(S * T, 3)
+    u1_flat = u1_all.reshape(S * T)                                        # (S*T,)
+    u2_flat = u2_all.reshape(S * T)
+
+    f_fn = get_two_point_seismic_f_fn(y1_flat, y2_flat, u1_flat, u2_flat, beta, sigma2)
     q_score = get_bel(f_fn=f_fn, n_paths=n_bel_paths, n_steps=n_bel_steps,
                       device=device, dtype=dtype)
-
-    dummy_y = y1.unsqueeze(0).expand(n_trials, 3)   # (K, 3) – sets B = K
 
     X_steps = dPnP_sampler_torch_batched(
         q_score=q_score,
         p_score=p_score,
-        y=dummy_y,
-        out_samples=out_samples,
+        y=y1_flat,            # (S*T, 3) — sets DPnP batch B = S*T
+        out_samples=P,
         eta=eta_t,
         grw_steps=grw_steps,
         seed=seed,
         end_only=False,
         device=device,
         dtype=dtype,
-    )   # (S+1, K, P, 3)
+    )   # (STEPS+1, S*T, P, 3)
 
-    X_finals    = X_steps[-1]                                   # (K, P, 3)
-    trial_means = sphere_mean_torch(X_finals, dim=1)             # (K, 3)
-    overall_mean = sphere_mean_torch(trial_means, dim=0)         # (3,)
+    # ── 4. Reshape and compute hierarchical means ─────────────────────────────
+    X_finals     = X_steps[-1].reshape(S, T, P, 3)                  # (S, T, P, 3)
+    trial_means  = sphere_mean_torch(X_finals, dim=2)                # (S, T, 3)
+    sensor_means = sphere_mean_torch(trial_means, dim=1)             # (S, 3)
+    global_mean  = sphere_mean_torch(sensor_means, dim=0)            # (3,)
 
-    # ---- 5. Metric for final reconstructions ----
-    score_trials = _reconstruction_score(trial_means, x_true.unsqueeze(0).expand_as(trial_means), metric)  # (K,)
-    score_overall = _reconstruction_score(overall_mean.unsqueeze(0), x_true.unsqueeze(0), metric).item()
+    # ── 5. Reconstruction quality metrics ─────────────────────────────────────
+    xt_ST = x_true.expand(S, T, 3)
+    xt_S  = x_true.expand(S, 3)
+    score_trials  = _reconstruction_score(trial_means,  xt_ST, metric)          # (S, T)
+    score_sensors = _reconstruction_score(sensor_means, xt_S,  metric)          # (S,)
+    score_global  = _reconstruction_score(global_mean[None], x_true[None], metric).item()
 
-    ylabel = "cosine similarity" if metric == "cosine" else "geodesic distance (°)"
-    better = "(↑ better)" if metric == "cosine" else "(↓ better)"
-    print(f"Trial {ylabel}: mean={score_trials.mean():.4f}  std={score_trials.std():.4f}  {better}")
-    print(f"Overall mean {ylabel}: {score_overall:.4f}")
+    print(f"\nTrial {ylabel}:  mean={score_trials.mean():.4f}  "
+          f"std={score_trials.std():.4f}  {better}")
+    print(f"Sensor-mean {ylabel}: mean={score_sensors.mean():.4f}  "
+          f"std={score_sensors.std():.4f}")
+    print(f"Global mean {ylabel}: {score_global:.4f}")
 
-    # ---- 6. Per-step metric for each N and trial ----
+    # ── 5b. Reflection points (likelihood-ambiguous partners) ─────────────────
+    # For sensor pair s, x'_s = reflect(x_true, span(y1_s, y2_s)).
+    # At x'_s: <x'_s, y_i> = <x_true, y_i> for both i, so the seismic
+    # likelihood is exactly the same — this is the point the sensors cannot
+    # distinguish from x_true without prior information.
+    x_reflected = _reflect_through_great_circle(
+        x_true.expand(S, 3), y1_sensors, y2_sensors
+    )   # (S, 3)
+    score_reflected = _reconstruction_score(x_reflected, x_true.expand(S, 3), metric)
+    print(f"Reflection point {ylabel}: mean={score_reflected.mean():.4f}  "
+          f"min={score_reflected.min():.4f}  max={score_reflected.max():.4f}")
+
+    # ── 6. Per-step metric for quality-vs-steps plot ──────────────────────────
     score_steps_by_N = {}
     for N in particle_counts:
-        X_sub      = X_steps[:, :, :N, :]                             # (S+1, K, N, 3)
-        X_sub_mean = sphere_mean_torch(X_sub, dim=2)                   # (S+1, K, 3)
+        X_sub      = X_steps[:, :, :N, :]                           # (STEPS+1, S*T, N, 3)
+        X_sub_mean = sphere_mean_torch(X_sub, dim=2)                 # (STEPS+1, S*T, 3)
         sc = _reconstruction_score(
             X_sub_mean,
-            x_true.unsqueeze(0).unsqueeze(0).expand_as(X_sub_mean),
+            x_true.expand(S * T, 3)[None].expand(STEPS + 1, S * T, 3),
             metric,
-        )   # (S+1, K)
-        score_steps_by_N[N] = sc.cpu()
+        )   # (STEPS+1, S*T)
+        score_steps_by_N[N] = sc.reshape(STEPS + 1, S, T).cpu()     # (STEPS+1, S, T)
 
-    # ---- 7. Plot: Mollweide KDE ----
-    Lon, Lat, grid_xyz = mollweide_plot_grid_xyz_torch(
-        n_lon=240, n_lat=120, device=trial_means.device, dtype=dtype
-    )
-    dens = spherical_kde_vmf(trial_means, grid_xyz, kappa=kde_kappa, normalize=True)
-    dens_np = dens.reshape(Lon.shape).cpu().numpy()
+    # ── 6b. Baseline: DPnP with flat (zero) prior ─────────────────────────────
+    # Samples from q(x) ∝ p(u1|x,y1) p(u2|x,y2) without the learned prior.
+    X_finals_bl = None
+    trial_means_bl = None
+    score_trials_bl = None
+    score_global_bl = None
+    score_steps_by_N_bl = {}
+    if include_baseline:
+        print("\nRunning likelihood-only baseline (zero prior score)…")
+        _zero_p = lambda x, t: torch.zeros_like(x)
+        X_steps_bl = dPnP_sampler_torch_batched(
+            q_score=q_score,
+            p_score=_zero_p,
+            y=y1_flat,
+            out_samples=P,
+            eta=eta_t,
+            grw_steps=grw_steps,
+            seed=seed + 99991,   # different seed to decorrelate
+            end_only=False,
+            device=device,
+            dtype=dtype,
+        )   # (STEPS+1, S*T, P, 3)
 
-    sensor_desc = (f"vMF sensors (kappa={kappa_sensors})" if kappa_sensors is not None
-                   else "fixed sensors")
-    fig, ax = plt.subplots(1, 1, figsize=(11, 5.5), subplot_kw={"projection": "mollweide"})
-    cf = ax.contourf(Lon.cpu().numpy(), Lat.cpu().numpy(), dens_np, levels=20, cmap="viridis")
-    fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
+        X_finals_bl    = X_steps_bl[-1].reshape(S, T, P, 3)
+        trial_means_bl = sphere_mean_torch(X_finals_bl, dim=2)           # (S, T, 3)
+        score_trials_bl = _reconstruction_score(trial_means_bl, xt_ST, metric)  # (S, T)
+        score_global_bl = _reconstruction_score(
+            sphere_mean_torch(trial_means_bl.reshape(S * T, 3), dim=0)[None],
+            x_true[None], metric
+        ).item()
+        print(f"Baseline trial {ylabel}: mean={score_trials_bl.mean():.4f}  "
+              f"std={score_trials_bl.std():.4f}  {better}")
+        print(f"Baseline global {ylabel}: {score_global_bl:.4f}")
 
-    ll_tm = extrinsic_to_mollweide_rad_torch(trial_means.cpu()).numpy()
-    ax.scatter(ll_tm[:, 1], ll_tm[:, 0], s=18, color="white", alpha=0.65,
-               edgecolors="none", zorder=5, label="trial means")
+        for N in particle_counts:
+            X_sub_bl      = X_steps_bl[:, :, :N, :]
+            X_sub_mean_bl = sphere_mean_torch(X_sub_bl, dim=2)
+            sc_bl = _reconstruction_score(
+                X_sub_mean_bl,
+                x_true.expand(S * T, 3)[None].expand(STEPS + 1, S * T, 3),
+                metric,
+            )
+            score_steps_by_N_bl[N] = sc_bl.reshape(STEPS + 1, S, T).cpu()
 
-    ll_om = extrinsic_to_mollweide_rad_torch(overall_mean.cpu()[None]).numpy()[0]
-    ax.scatter([ll_om[1]], [ll_om[0]], s=120, color="gold", marker="*",
-               edgecolors="black", linewidths=1.2, zorder=8, label="overall mean")
+    # ── 7. Plot helpers ───────────────────────────────────────────────────────
+    _lon_ax_labels = [
+        "150°W","120°W","90°W","60°W","30°W","0°",
+        "30°E","60°E","90°E","120°E","150°E"
+    ]
 
-    ll_x = extrinsic_to_mollweide_rad_torch(x_true.cpu()[None]).numpy()[0]
-    ax.scatter([ll_x[1]], [ll_x[0]], s=90, color="tab:red",
-               edgecolors="black", linewidths=1.2, zorder=9, label=r"$x_{\rm true}$")
+    def _mollweide_ax(samples_3d, title_str, *, extra_markers=None):
+        """Draw a filled KDE contour on a Mollweide axis and return (fig, ax)."""
+        samp = normalize_torch(samples_3d.detach().cpu())
+        Lon, Lat, grid_xyz = mollweide_plot_grid_xyz_torch(
+            n_lon=240, n_lat=120, device=samp.device, dtype=samp.dtype)
+        dens = spherical_kde_vmf(samp, grid_xyz, kappa=kde_kappa, normalize=True)
+        dens_np = dens.reshape(Lon.shape).cpu().numpy()
 
-    for yi, lbl, col in [(y1, r"$y_1$", "tab:cyan"), (y2, r"$y_2$", "tab:orange")]:
-        ll_yi = extrinsic_to_mollweide_rad_torch(yi.cpu()[None]).numpy()[0]
-        ax.scatter([ll_yi[1]], [ll_yi[0]], s=80, color=col, marker="D",
-                   edgecolors="black", linewidths=1.0, zorder=7, label=lbl)
+        fig, ax = plt.subplots(1, 1, figsize=(11, 5.5),
+                               subplot_kw={"projection": "mollweide"})
+        cf = ax.contourf(Lon.cpu().numpy(), Lat.cpu().numpy(), dens_np,
+                         levels=20, cmap="viridis")
+        fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
 
-    ax.grid(True, alpha=0.28)
-    ax.set_xticklabels(
-        ["150°W","120°W","90°W","60°W","30°W","0°","30°E","60°E","90°E","120°E","150°E"]
-    )
-    ax.set_title(
-        f"Two-point seismic reconstruction — {sensor_desc}\n"
-        f"n_trials={n_trials}, beta={beta}, sigma2={sigma2}"
-    )
-    ax.legend(loc="upper right", fontsize=8)
-    plt.tight_layout()
-    plt.show()
+        # x_true
+        ll_x = extrinsic_to_mollweide_rad_torch(x_true.cpu()[None]).numpy()[0]
+        ax.scatter([ll_x[1]], [ll_x[0]], s=100, color="tab:red",
+                   edgecolors="black", linewidths=1.2, zorder=10,
+                   label=r"$x_{\rm true}$")
 
-    # ---- 8. Plot: quality vs DPnP steps ----
-    steps_arr = np.arange(S + 1)
-    mean_score_by_N = {N: score_steps_by_N[N].mean(dim=1).numpy() for N in particle_counts}
-    stderr_score_by_N = {
-        N: score_steps_by_N[N].std(dim=1, unbiased=False).numpy() / np.sqrt(n_trials)
-        for N in particle_counts
-    }
+        if extra_markers:
+            for pts, kwargs in extra_markers:
+                ll = extrinsic_to_mollweide_rad_torch(
+                    normalize_torch(pts.detach().cpu())).numpy()
+                if ll.ndim == 1:
+                    ll = ll[None]
+                ax.scatter(ll[:, 1], ll[:, 0], **kwargs)
 
-    ymin = min(float(v.min()) for v in mean_score_by_N.values())
-    ymax = max(float(v.max()) for v in mean_score_by_N.values())
-    pad = 0.05 * max(1e-8, ymax - ymin)
+        ax.grid(True, alpha=0.28)
+        ax.set_xticklabels(_lon_ax_labels)
+        ax.set_title(title_str)
+        ax.legend(loc="upper right", fontsize=7)
+        plt.tight_layout()
+        plt.show()
+        return fig, ax
 
-    plt.figure(figsize=(8, 5))
-    for N in particle_counts:
-        plt.plot(steps_arr, mean_score_by_N[N], marker="o", linewidth=2, label=f"N = {N}")
-        if show_stderr:
-            plt.fill_between(
-                steps_arr,
-                mean_score_by_N[N] - stderr_score_by_N[N],
-                mean_score_by_N[N] + stderr_score_by_N[N],
-                alpha=0.12,
+    sensor_colors = plt.cm.tab10(np.linspace(0, 1, max(S, 2)))
+
+    # ── 8. Per-sensor plots ───────────────────────────────────────────────────
+    if plot_per_sensor:
+        for s in range(S):
+            # KDE from all T*P particles for this sensor pair
+            all_particles_s = X_finals[s].reshape(T * P, 3).cpu()
+            trial_means_s   = trial_means[s].cpu()     # (T, 3)
+            sensor_mean_s   = sensor_means[s].cpu()    # (3,)
+            y1s = y1_sensors[s].cpu()
+            y2s = y2_sensors[s].cpu()
+            xr_s = x_reflected[s].cpu()                # reflection (3,)
+
+            extra = [
+                # per-trial mean markers (DPnP)
+                (trial_means_s,
+                 dict(s=20, color="white", alpha=0.7, edgecolors="none",
+                      zorder=6, label=f"DPnP trial means (T={T})")),
+                # sensor-pair mean (DPnP)
+                (sensor_mean_s[None],
+                 dict(s=130, color="gold", marker="*", edgecolors="black",
+                      linewidths=1.2, zorder=9, label="DPnP sensor mean")),
+                # sensors
+                (y1s[None],
+                 dict(s=80, color="tab:cyan", marker="D", edgecolors="black",
+                      linewidths=1.0, zorder=8, label=r"$y_1$")),
+                (y2s[None],
+                 dict(s=80, color="tab:orange", marker="D", edgecolors="black",
+                      linewidths=1.0, zorder=8, label=r"$y_2$")),
+                # reflection point: identical likelihood as x_true
+                (xr_s[None],
+                 dict(s=110, color="tab:purple", marker="X", edgecolors="black",
+                      linewidths=1.0, zorder=10,
+                      label=r"$x'$ (reflection, same likelihood)")),
+            ]
+
+            # optionally overlay baseline trial means
+            if include_baseline and trial_means_bl is not None:
+                extra.append((
+                    trial_means_bl[s].cpu(),
+                    dict(s=20, color="tab:pink", alpha=0.7, edgecolors="none",
+                         zorder=6, label=f"baseline trial means (T={T})"),
+                ))
+
+            score_s = score_sensors[s].item()
+            _mollweide_ax(
+                all_particles_s,
+                title_str=(
+                    f"Sensor pair {s + 1}/{S} — {sensor_desc}\n"
+                    f"KDE of {T}×{P} DPnP particles | sensor-mean {ylabel}={score_s:.4f} {better}"
+                ),
+                extra_markers=extra,
             )
 
-    plt.xlabel("DPnP step")
-    plt.ylabel(f"mean {ylabel}  {better}")
-    plt.title(
-        f"Two-point seismic: {ylabel} vs DPnP step\n"
-        f"{sensor_desc}, averaged over {n_trials} (u1, u2) realisations"
-    )
-    plt.ylim(ymin - pad, ymax + pad)
-    plt.grid(alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+    # ── 9. Global plot (across all sensor pairs) ──────────────────────────────
+    if plot_global:
+        # KDE from all S*T trial means
+        all_trial_means = trial_means.reshape(S * T, 3).cpu()   # (S*T, 3)
 
-    return {
-        "x_true": x_true.cpu(),
-        "y1": y1.cpu(),
-        "y2": y2.cpu(),
-        "u1_all": u1_all.cpu(),
-        "u2_all": u2_all.cpu(),
-        "X_finals": X_finals.cpu(),
-        "trial_means": trial_means.cpu(),
-        "overall_mean": overall_mean.cpu(),
-        "score_trials": score_trials.cpu(),
-        "score_steps_by_N": {N: score_steps_by_N[N].numpy() for N in particle_counts},
-        "metric": metric,
+        extra_global = []
+        for s in range(S):
+            sm = sensor_means[s].cpu()
+            col = sensor_colors[s % len(sensor_colors)]
+            extra_global.append((
+                sm[None],
+                dict(s=70, color=col, marker="o", edgecolors="black",
+                     linewidths=1.0, zorder=7,
+                     label=f"DPnP sensor mean {s+1}" if s < 6 else None,
+                     alpha=0.85),
+            ))
+            # reflection point for each sensor pair
+            extra_global.append((
+                x_reflected[s].cpu()[None],
+                dict(s=55, color="tab:purple", marker="X", edgecolors="black",
+                     linewidths=0.8, zorder=8, alpha=0.65,
+                     label=r"$x'$ reflections" if s == 0 else None),
+            ))
+        extra_global.append((
+            global_mean.cpu()[None],
+            dict(s=160, color="gold", marker="*", edgecolors="black",
+                 linewidths=1.4, zorder=9, label="DPnP global mean"),
+        ))
+        if include_baseline and trial_means_bl is not None:
+            bl_global_mean = sphere_mean_torch(
+                trial_means_bl.reshape(S * T, 3).cpu(), dim=0
+            )
+            extra_global.append((
+                bl_global_mean[None],
+                dict(s=160, color="tab:pink", marker="*", edgecolors="black",
+                     linewidths=1.4, zorder=9, label="baseline global mean"),
+            ))
+
+        _mollweide_ax(
+            all_trial_means,
+            title_str=(
+                f"Global view — {sensor_desc}\n"
+                f"KDE of all {S}×{T} DPnP trial means | "
+                f"global {ylabel}={score_global:.4f} {better}"
+            ),
+            extra_markers=extra_global,
+        )
+
+    # ── 10. Quality vs DPnP steps ─────────────────────────────────────────────
+    if plot_quality_vs_steps:
+        steps_arr   = np.arange(STEPS + 1)
+        n_total     = S * T
+        mean_sc_N   = {N: score_steps_by_N[N].mean(dim=(1, 2)).numpy() for N in particle_counts}
+        stderr_sc_N = {
+            N: score_steps_by_N[N].reshape(STEPS + 1, n_total).std(dim=1, unbiased=False).numpy()
+               / np.sqrt(n_total)
+            for N in particle_counts
+        }
+
+        all_vals = list(mean_sc_N.values())
+        if include_baseline and score_steps_by_N_bl:
+            mean_sc_N_bl   = {N: score_steps_by_N_bl[N].mean(dim=(1, 2)).numpy() for N in particle_counts}
+            stderr_sc_N_bl = {
+                N: score_steps_by_N_bl[N].reshape(STEPS + 1, n_total).std(dim=1, unbiased=False).numpy()
+                   / np.sqrt(n_total)
+                for N in particle_counts
+            }
+            all_vals += list(mean_sc_N_bl.values())
+        else:
+            mean_sc_N_bl = {}
+            stderr_sc_N_bl = {}
+
+        ymin = min(float(v.min()) for v in all_vals)
+        ymax = max(float(v.max()) for v in all_vals)
+        pad  = 0.05 * max(1e-8, ymax - ymin)
+
+        prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        plt.figure(figsize=(8, 5))
+        for i, N in enumerate(particle_counts):
+            col = prop_cycle[i % len(prop_cycle)]
+            plt.plot(steps_arr, mean_sc_N[N], marker="o", linewidth=2,
+                     color=col, label=f"DPnP N={N}")
+            if show_stderr:
+                plt.fill_between(steps_arr,
+                                 mean_sc_N[N] - stderr_sc_N[N],
+                                 mean_sc_N[N] + stderr_sc_N[N],
+                                 alpha=0.12, color=col)
+            if N in mean_sc_N_bl:
+                plt.plot(steps_arr, mean_sc_N_bl[N], marker="s", linewidth=1.5,
+                         linestyle="--", color=col, alpha=0.65,
+                         label=f"baseline N={N}")
+                if show_stderr:
+                    plt.fill_between(steps_arr,
+                                     mean_sc_N_bl[N] - stderr_sc_N_bl[N],
+                                     mean_sc_N_bl[N] + stderr_sc_N_bl[N],
+                                     alpha=0.07, color=col)
+
+        plt.xlabel("DPnP step")
+        plt.ylabel(f"mean {ylabel}  {better}")
+        plt.title(
+            f"Two-point seismic: {ylabel} vs DPnP step\n"
+            f"{sensor_desc}, averaged over {S}×{T} trials"
+            + (" | dashed = likelihood-only baseline" if include_baseline else "")
+        )
+        plt.ylim(ymin - pad, ymax + pad)
+        plt.grid(alpha=0.25)
+        plt.legend(fontsize=8, ncol=2)
+        plt.tight_layout()
+        plt.show()
+
+    out = {
+        "x_true":           x_true.cpu(),
+        "y1_sensors":       y1_sensors.cpu(),      # (S, 3)
+        "y2_sensors":       y2_sensors.cpu(),      # (S, 3)
+        "x_reflected":      x_reflected.cpu(),     # (S, 3)
+        "u1_all":           u1_all.cpu(),           # (S, T)
+        "u2_all":           u2_all.cpu(),           # (S, T)
+        "X_finals":         X_finals.cpu(),         # (S, T, P, 3)
+        "trial_means":      trial_means.cpu(),      # (S, T, 3)
+        "sensor_means":     sensor_means.cpu(),     # (S, 3)
+        "global_mean":      global_mean.cpu(),      # (3,)
+        "score_trials":     score_trials.cpu(),     # (S, T)
+        "score_sensors":    score_sensors.cpu(),    # (S,)
+        "score_global":     score_global,           # float
+        "score_reflected":  score_reflected.cpu(),  # (S,)
+        "score_steps_by_N": {N: score_steps_by_N[N].numpy()
+                             for N in particle_counts},
+        "metric":           metric,
     }
+    if include_baseline:
+        out.update({
+            "X_finals_bl":         X_finals_bl.cpu() if X_finals_bl is not None else None,
+            "trial_means_bl":      trial_means_bl.cpu() if trial_means_bl is not None else None,
+            "score_trials_bl":     score_trials_bl.cpu() if score_trials_bl is not None else None,
+            "score_global_bl":     score_global_bl,
+            "score_steps_by_N_bl": {N: score_steps_by_N_bl[N].numpy()
+                                    for N in particle_counts},
+        })
+    return out
