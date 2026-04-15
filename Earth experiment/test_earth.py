@@ -55,35 +55,17 @@ def cosine_similarity_vs_steps_for_particle_counts(
     dtype=torch.float32,
     seed=0,
     show_stderr=True,
+    aggregate_mode="mean",   # "mean" or "min_overall"
 ):
     """
     Sample x_true and y as before. For each DPnP step and each requested particle
     count N, compute the cosine similarity between x_true and the spherical mean
-    of the first N sampled particles. Then overlay the cosine-vs-step curves for
-    all requested N values.
+    of the first N sampled particles.
 
-    Parameters
-    ----------
-    particle_counts : iterable of int
-        Values of N for which to compute:
-            cos( sphere_mean( X_steps[:, :, :N, :] ), x_true )
-
-        Each N must satisfy 1 <= N <= out_samples.
-
-    Returns
-    -------
-    results : dict
-        {
-          "steps": np.ndarray shape (S+1,),
-          "obs_cos_baseline": float,
-          "by_particle_count": {
-              N: {
-                  "mean_cos": np.ndarray shape (S+1,),
-                  "stderr_cos": np.ndarray shape (S+1,),
-              },
-              ...
-          }
-        }
+    aggregate_mode:
+      - "mean": current behavior
+      - "min_overall": use the maximum cosine over all sampled pairs overall,
+                       both for the dashed observation line and for each DPnP curve
     """
     device = torch.device(device)
 
@@ -97,6 +79,8 @@ def cosine_similarity_vs_steps_for_particle_counts(
             f"max requested particle count = {max(particle_counts)} exceeds "
             f"out_samples = {out_samples}"
         )
+    if aggregate_mode not in {"mean", "min_overall"}:
+        raise ValueError('aggregate_mode must be "mean" or "min_overall"')
 
     x_true_all, y_all = sample_xtrue_y_batches_from_dataloader(
         dataloader=dataloader,
@@ -148,79 +132,100 @@ def cosine_similarity_vs_steps_for_particle_counts(
         for N in particle_counts
     }
 
-    mean_cos_by_N = {
-        N: all_cos_by_N[N].mean(dim=1).numpy()
-        for N in particle_counts
-    }
+    if aggregate_mode == "mean":
+        curve_by_N = {
+            N: all_cos_by_N[N].mean(dim=1).numpy()
+            for N in particle_counts
+        }
+        stderr_by_N = {
+            N: (
+                all_cos_by_N[N].std(dim=1, unbiased=False).numpy()
+                / np.sqrt(all_cos_by_N[N].shape[1])
+            )
+            for N in particle_counts
+        }
 
-    stderr_cos_by_N = {
-        N: (
-            all_cos_by_N[N].std(dim=1, unbiased=False).numpy()
-            / np.sqrt(all_cos_by_N[N].shape[1])
+        obs_cos = (x_true_all * y_all).sum(dim=-1)
+        obs_cos_baseline = obs_cos.mean().item()
+
+        ylabel = "mean cosine similarity"
+        baseline_label = "mean cosine from observation y"
+        curve_label_fmt = "N = {N}"
+        plot_title = (
+            "Cosine similarity vs DPnP step\n"
+            "spherical mean reconstruction using N particles"
         )
-        for N in particle_counts
-    }
+
+    else:  # aggregate_mode == "min_overall"
+        curve_by_N = {
+            N: all_cos_by_N[N].min(dim=1).values.numpy()
+            for N in particle_counts
+        }
+
+        # no stderr for a max-overall summary
+        stderr_by_N = {N: None for N in particle_counts}
+
+        obs_cos = (x_true_all * y_all).sum(dim=-1)
+        obs_cos_baseline = obs_cos.min().item()
+
+        ylabel = "min cosine similarity overall"
+        baseline_label = "min cosine from observation y overall"
+        curve_label_fmt = "N = {N}"
+        plot_title = (
+            "Min cosine similarity vs DPnP step\n"
+            "spherical mean reconstruction using N particles"
+        )
 
     steps = np.arange(S_plus_1)
 
-    # observation baseline
-    obs_cos = (x_true_all * y_all).sum(dim=-1)
-    mean_obs_cos = obs_cos.mean().item()
-
-    # shared y-limits
     ymin_cos = min(
-        [mean_obs_cos] + [float(mean_cos_by_N[N].min()) for N in particle_counts]
+        [obs_cos_baseline] + [float(curve_by_N[N].min()) for N in particle_counts]
     )
     ymax_cos = max(
-        [mean_obs_cos] + [float(mean_cos_by_N[N].max()) for N in particle_counts]
+        [obs_cos_baseline] + [float(curve_by_N[N].max()) for N in particle_counts]
     )
     pad_cos = 0.05 * max(1e-8, ymax_cos - ymin_cos)
     ymin_cos -= pad_cos
     ymax_cos += pad_cos
 
-    # print summary
-    print(f"mean_obs_cos = {mean_obs_cos:.6f}")
+    print(f"{baseline_label} = {obs_cos_baseline:.6f}")
     for N in particle_counts:
-        print(f"N = {N:>3d}, step 0 mean cos = {mean_cos_by_N[N][0]:.6f}")
+        print(f"N = {N:>3d}, step 0 value = {curve_by_N[N][0]:.6f}")
 
-    # overlay plot
     plt.figure(figsize=(8, 5))
 
     plt.axhline(
-        mean_obs_cos,
+        obs_cos_baseline,
         linestyle="--",
         linewidth=2.5,
         color="black",
         alpha=0.9,
         zorder=1,
-        label="mean cosine from observation y",
+        label=baseline_label,
     )
 
     for N in particle_counts:
         plt.plot(
             steps,
-            mean_cos_by_N[N],
+            curve_by_N[N],
             marker="o",
             linewidth=2,
             zorder=3,
-            label=f"N = {N}",
+            label=curve_label_fmt.format(N=N),
         )
 
-        if show_stderr:
+        if show_stderr and aggregate_mode == "mean":
             plt.fill_between(
                 steps,
-                mean_cos_by_N[N] - stderr_cos_by_N[N],
-                mean_cos_by_N[N] + stderr_cos_by_N[N],
+                curve_by_N[N] - stderr_by_N[N],
+                curve_by_N[N] + stderr_by_N[N],
                 alpha=0.12,
                 zorder=2,
             )
 
     plt.xlabel("DPnP step")
-    plt.ylabel("mean cosine similarity")
-    plt.title(
-        "Cosine similarity vs DPnP step\n"
-        "spherical mean reconstruction using N particles"
-    )
+    plt.ylabel(ylabel)
+    plt.title(plot_title)
     plt.ylim(ymin_cos, ymax_cos)
     plt.grid(alpha=0.25)
     plt.legend()
@@ -229,11 +234,12 @@ def cosine_similarity_vs_steps_for_particle_counts(
 
     return {
         "steps": steps,
-        "obs_cos_baseline": mean_obs_cos,
+        "aggregate_mode": aggregate_mode,
+        "obs_cos_baseline": obs_cos_baseline,
         "by_particle_count": {
             N: {
-                "mean_cos": mean_cos_by_N[N],
-                "stderr_cos": stderr_cos_by_N[N],
+                "curve": curve_by_N[N],
+                "stderr": stderr_by_N[N],
             }
             for N in particle_counts
         },
@@ -263,7 +269,8 @@ def plot_spherical_kde_mollweide(
     annotate_xy: bool = False,
     annotate_recon_mean: bool = False,
     title: str = "Spherical KDE of final samples (Mollweide projection)",
-    levels: int = 20
+    levels: int = 20,
+    color_bar = False
 ):
     X_final = X_final.detach().cpu()
     if X_final.ndim == 2:
@@ -290,7 +297,8 @@ def plot_spherical_kde_mollweide(
     ax = fig.add_subplot(111, projection="mollweide")
 
     cf = ax.contourf(lon_np, lat_np, dens_np, levels=levels, cmap="viridis")
-    fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
+    if color_bar:
+        fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
 
     if overlay_samples:
         ll_samp = extrinsic_to_mollweide_rad_torch(samples).cpu().numpy()
@@ -459,7 +467,8 @@ def plot_multi_xtrue_with_reconstruction_kde(
     overlay_recon_points: bool = True,
     overlay_recon_count: int = 400,
     levels :int = 20,
-    color:str = 'white'
+    color:str = 'white',
+    color_bar = False
 ):
     recon_means = normalize_torch(recon_means.detach().cpu())
     x_true_all = normalize_torch(x_true_all.detach().cpu())
@@ -484,7 +493,8 @@ def plot_multi_xtrue_with_reconstruction_kde(
     ax = fig.add_subplot(111, projection="mollweide")
 
     cf = ax.contourf(lon_np, lat_np, dens_np, levels=levels, cmap="viridis")
-    fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
+    if color_bar:
+        fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
 
     if overlay_recon_points:
         ll_r = extrinsic_to_mollweide_rad_torch(recon_means).numpy()
@@ -555,6 +565,7 @@ def plot_dpnp_reconstruction_kde(
     overlay_y_obs_count: int = 200,
     y_mean: torch.Tensor = None,
     levels: int = 20,
+    color_bar = False
 ):
     recon_samples = normalize_torch(recon_samples.detach().cpu())
     x_true = normalize_torch(x_true.detach().cpu())
@@ -585,7 +596,8 @@ def plot_dpnp_reconstruction_kde(
     ax = fig.add_subplot(111, projection="mollweide")
 
     cf = ax.contourf(lon_np, lat_np, dens_np, levels=levels, cmap="viridis")
-    fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
+    if color_bar:
+        fig.colorbar(cf, ax=ax, shrink=0.82, pad=0.08, label="spherical KDE")
 
     if overlay_samples:
         ll_r = extrinsic_to_mollweide_rad_torch(recon_samples).numpy()
@@ -964,9 +976,9 @@ def make_aggregate_plot_from_results(
     color="white",
     max_kde_samples=5000,    # automatic subsampling cap for x_all
     seed=0,
-    x_size = 20,
-    recon_size = 20,
-    recon_alpha = 0.6
+    x_size=20,
+    recon_size=20,
+    recon_alpha=0.6,
 ):
     """
     Aggregate KDE plot from test_dpnp_sampler_multiple_xtrue results.
@@ -976,11 +988,10 @@ def make_aggregate_plot_from_results(
     mode="x_all"         -> pooled non-averaged final reconstruction particles
                            (all particles across all x_true and y; automatically
                            subsampled for KDE if too large)
-    mode="x_global_mean" -> one aggregate mean hat{x} for each x_true, where
-                           hat{x}_i = sphere_mean(recon_mean_per_y for that x_true)
+    mode="x_global_mean" -> refactored to also use pooled per-y averaged
+                           reconstructions for BOTH the KDE and overlayed points
     mode="y"             -> pooled sampled observations
     """
-
     if len(results) == 0:
         raise ValueError("results is empty")
 
@@ -1007,16 +1018,15 @@ def make_aggregate_plot_from_results(
         )
 
     elif mode == "x_global_mean":
-        samples = torch.stack(
-            [
-                normalize_torch(sphere_mean_torch(r["recon_mean_per_y"], dim=0))
-                for r in results
-            ],
+        # Refactor requested:
+        # use all per-y reconstructions for BOTH KDE and overlayed points
+        samples = torch.cat(
+            [r["recon_mean_per_y"] for r in results],
             dim=0,
         )
         default_title = (
-            "All selected $x_{true}$ overlaid with KDE of aggregate mean "
-            "reconstruction for each $x_{true}$"
+            "All selected $x_{true}$ overlaid with KDE of pooled "
+            "per-$y$ averaged reconstructions"
         )
 
     elif mode == "y":
@@ -1061,10 +1071,11 @@ def make_aggregate_plot_from_results(
         overlay_recon_count=min(overlay_count, samples.shape[0]),
         levels=levels,
         color=color,
-        x_marker_size= x_size,
-        recon_marker_size= recon_size,
-        recon_alpha=recon_alpha
+        x_marker_size=x_size,
+        recon_marker_size=recon_size,
+        recon_alpha=recon_alpha,
     )
+
 @torch.no_grad()
 def replot_dpnp_results_for_xtrue(
     results,

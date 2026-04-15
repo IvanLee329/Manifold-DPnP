@@ -7,57 +7,6 @@ from utils import normalize_torch
 from torch.optim.lr_scheduler import LambdaLR
 import os
 ############################ schedules #############################
-class BetaSchedule(nn.Module):
-    def beta_t(self, t: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
-
-    def log_mean_coeff(self, t: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
-
-    def reverse(self):
-        raise NotImplementedError
-
-
-class LinearBetaSchedule(BetaSchedule):
-    def __init__(
-        self,
-        tf: float = 1.0,
-        t0: float = 0.0,
-        beta_0: float = 1e-3,
-        beta_f: float = 5.0,
-    ):
-        super().__init__()
-        self.tf = tf
-        self.t0 = t0
-        self.beta_0 = beta_0
-        self.beta_f = beta_f
-
-    def beta_t(self, t: torch.Tensor) -> torch.Tensor:
-        normed_t = (t - self.t0) / (self.tf - self.t0)
-        return self.beta_0 + normed_t * (self.beta_f - self.beta_0)
-
-    def log_mean_coeff(self, t: torch.Tensor) -> torch.Tensor:
-        normed_t = (t - self.t0) / (self.tf - self.t0)
-        return -0.5 * (
-            0.5 * normed_t**2 * (self.beta_f - self.beta_0)
-            + normed_t * self.beta_0
-        )
-
-    def rescale_t(self, t: torch.Tensor) -> torch.Tensor:
-        return -2.0 * self.log_mean_coeff(t)
-
-    def reverse(self):
-        return LinearBetaSchedule(
-            tf=self.t0,
-            t0=self.tf,
-            beta_f=self.beta_0,
-            beta_0=self.beta_f,
-        )
-
-
-class ConstantBetaSchedule(LinearBetaSchedule):
-    def __init__(self, tf: float = 1.0, value: float = 1.0):
-        super().__init__(tf=tf, t0=0.0, beta_0=value, beta_f=value)
 
 def make_linear_warmup_cosine_scheduler(
     optimizer: torch.optim.Optimizer,
@@ -202,14 +151,12 @@ def ism_training_step_pathwise(
     t = T * (k_idx.float() / n_steps)
     t = t.unsqueeze(-1)
 
-    beta_schedule = LinearBetaSchedule()
-
     with torch.no_grad():
         zero_drift = lambda x, tau: torch.zeros_like(x)
 
         path = GRW_SDE_path_integrator(
             b=zero_drift,
-            sig=lambda x, tau: torch.sqrt(beta_schedule.beta_t(tau)),
+            sig=lambda x, tau: 1,
             x=x0,
             T=T,
             n_steps=n_steps,
@@ -241,8 +188,6 @@ def evaluate_ism(
 
     if device is None:
         device = next(model.parameters()).device
-
-    beta_schedule = LinearBetaSchedule()
 
     # Fixed generator so eval is reproducible across calls
     g = torch.Generator(device=device)
@@ -281,7 +226,7 @@ def evaluate_ism(
 
             path = GRW_SDE_path_integrator(
                 b=zero_drift,
-                sig=lambda x, tau: torch.sqrt(beta_schedule.beta_t(tau)),
+                sig=lambda x, tau: 1,
                 x=x0,
                 T=T,
                 n_steps=n_steps,
