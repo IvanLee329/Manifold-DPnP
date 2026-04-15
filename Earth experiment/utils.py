@@ -65,6 +65,25 @@ def sphere_exp_map_torch(x: torch.Tensor, v: torch.Tensor, eps: float = 1e-12):
 
     return normalize_torch(y, eps)
 
+def sphere_log_map_torch(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12):
+    """
+    Logarithmic map on the unit sphere (inverse of the exponential map).
+
+    Returns the tangent vector v ∈ T_x S^{d-1} such that Exp_x(v) = y.
+
+    x : (..., d) base point on S^{d-1}
+    y : (..., d) target point on S^{d-1}
+
+    Returns:
+        (..., d) tangent vector at x.  Zero when x ≈ y.
+    """
+    dot = (x * y).sum(dim=-1, keepdim=True).clamp(-1.0 + eps, 1.0 - eps)
+    y_perp = y - dot * x                                         # component ⊥ x
+    y_perp_norm = y_perp.norm(dim=-1, keepdim=True).clamp_min(eps)
+    theta = torch.arccos(dot)                                     # geodesic distance
+    return theta * y_perp / y_perp_norm
+
+
 def sphere_distance_torch(x, y, euclidean=True, eps=None):
     if eps is None:
         eps = get_eps(x.dtype)
@@ -760,8 +779,21 @@ def mollweide_plot_grid_xyz_torch(
 
 
 # ============================================================
-# Batched geodesic random-walk Metropolis sampler on S^2
+# Batched MCMC sampler on S^2 (geodesic random-walk or MALA)
 # ============================================================
+
+def _riemannian_grad_log_target(x, log_target_fn):
+    """
+    Compute the Riemannian gradient grad_{S^2} log q(x) via autograd.
+
+    Returns (grad, log_q) where grad ∈ T_x S^2 and log_q = log q(x).
+    """
+    with torch.enable_grad():
+        x_req = x.detach().requires_grad_(True)
+        log_q = log_target_fn(x_req)
+        ambient_grad = torch.autograd.grad(log_q.sum(), x_req)[0]
+    return tangent_project_torch(x, ambient_grad.detach()), log_q.detach()
+
 
 @torch.no_grad()
 def mcmc_mh_s2_batched(
@@ -770,36 +802,45 @@ def mcmc_mh_s2_batched(
     n_samples: int,
     tau: float = 0.1,
     n_burnin: int = 500,
+    x_init: torch.Tensor | None = None,
+    use_mala: bool = False,
     device="cpu",
     dtype=torch.float32,
     seed: int = 0,
 ) -> torch.Tensor:
     """
-    Batched geodesic random-walk Metropolis sampler on S^2.
+    Batched MCMC sampler on S^2 with geodesic proposals.
 
-    Runs B independent chains in parallel.  No score network required —
-    samples directly from the unnormalised target density.
+    Supports two modes:
 
-    At each iteration k the proposal is:
-        1. z ~ N(0, I_3)
-        2. v = (I - x x^T) z            (project onto tangent space T_x S^2)
-        3. x* = Exp_x(τ v)              (move along the geodesic)
-    where Exp_x(w) = cos(||w||) x + sin(||w||) w/||w||.
+    **Random walk** (use_mala=False, default):
+        v = τ (I − x xᵀ) z,   z ~ N(0, I₃)
+        x* = Exp_x(v)
+        α  = min{1, q(x*)/q(x)}        (symmetric proposal)
 
-    The isotropic tangent noise gives a symmetric proposal on S^2,
-    so the MH acceptance ratio reduces to
-        α = min{1, q(x*) / q(x^{(k)})}.
+    **MALA** (use_mala=True):
+        g  = grad_{S²} log q(x)         (via autograd)
+        ξ  = (I − x xᵀ) z,  z ~ N(0, I₃)
+        v  = τ g + √(2τ) ξ
+        x* = Exp_x(v)
+        α  = min{1, q(x*) q_rev(x|x*) / [q(x) q_fwd(x*|x)]}
+
+    Runs B independent chains in parallel.
 
     Parameters
     ----------
     log_target_fn : callable
-        log_target_fn(x) where x has shape (B, 3) → (B,) log-probabilities.
-        Need not be normalised; only differences matter.
+        log_target_fn(x) where x has shape (B, 3) → (B,).
+        Must be differentiable w.r.t. x when use_mala=True.
     B             : int   -- number of independent chains
     n_samples     : int   -- samples to keep per chain (after burn-in)
-    tau           : float -- geodesic step size (> 0, smaller → higher
-                             acceptance but slower mixing)
+    tau           : float -- step size (geodesic scale for RW; η for MALA)
     n_burnin      : int   -- burn-in steps discarded before recording
+    x_init        : (B, 3) or (3,) tensor, or None
+                    Initial chain positions.  If None, initialise uniformly
+                    on S².  Providing a point near the high-density region
+                    (e.g. a sensor location) dramatically improves mixing.
+    use_mala      : bool  -- if True, use manifold MALA instead of random walk
     device, dtype, seed
 
     Returns
@@ -811,34 +852,69 @@ def mcmc_mh_s2_batched(
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
 
-    # Initialise chains uniformly on S^2
-    x = normalize_torch(
-        torch.randn(B, 3, device=device, dtype=dtype, generator=gen)
-    )
-    log_q = log_target_fn(x)          # (B,)
+    # ── Initialise chains ────────────────────────────────────────────────
+    if x_init is not None:
+        x_init_t = normalize_torch(
+            torch.as_tensor(x_init, device=device, dtype=dtype)
+        )
+        if x_init_t.dim() == 1:
+            x_init_t = x_init_t.unsqueeze(0).expand(B, 3)
+        x = x_init_t.clone()
+    else:
+        x = normalize_torch(
+            torch.randn(B, 3, device=device, dtype=dtype, generator=gen)
+        )
+
+    # ── Pre-compute initial state ────────────────────────────────────────
+    if use_mala:
+        grad_x, log_q = _riemannian_grad_log_target(x, log_target_fn)
+    else:
+        log_q = log_target_fn(x)                               # (B,)
 
     samples = torch.empty(n_samples, B, 3, device=device, dtype=dtype)
     n_total  = n_burnin + n_samples
     accepted_total = 0.0
 
     for step in range(n_total):
-        # ── geodesic random-walk proposal ────────────────────────────────
-        # 1. sample tangent perturbation at current point x
+        # ── Tangent noise ξ ~ N(0, P_x) ─────────────────────────────────
         z = torch.randn(B, 3, device=device, dtype=dtype, generator=gen)
-        v = tangent_project_torch(x, z)                    # (B, 3)
+        xi = tangent_project_torch(x, z)                       # (B, 3)
 
-        # 2. propose by moving along the geodesic with step size τ
-        x_prop = sphere_exp_map_torch(x, tau * v)          # (B, 3)
+        if use_mala:
+            # ── MALA proposal ────────────────────────────────────────────
+            #   v = η grad_{S²} log q(x)  +  √(2η) ξ
+            v = tau * grad_x + math.sqrt(2.0 * tau) * xi
+            x_prop = sphere_exp_map_torch(x, v)                # (B, 3)
 
-        log_q_prop = log_target_fn(x_prop)                 # (B,)
+            grad_prop, log_q_prop = _riemannian_grad_log_target(
+                x_prop, log_target_fn
+            )
 
-        # ── Acceptance (symmetric proposal → target ratio only) ──────────
-        log_alpha = (log_q_prop - log_q).clamp(max=0.0)    # (B,)
+            # MH correction for the asymmetric proposal
+            v_fwd = sphere_log_map_torch(x, x_prop)            # Log_x(x*)
+            v_rev = sphere_log_map_torch(x_prop, x)            # Log_{x*}(x)
+
+            fwd_sq = (v_fwd - tau * grad_x).pow(2).sum(dim=-1)
+            rev_sq = (v_rev - tau * grad_prop).pow(2).sum(dim=-1)
+
+            log_alpha = (
+                (log_q_prop - log_q)
+                + (fwd_sq - rev_sq) / (4.0 * tau)
+            ).clamp(max=0.0)
+        else:
+            # ── Geodesic random-walk proposal ────────────────────────────
+            x_prop = sphere_exp_map_torch(x, tau * xi)         # (B, 3)
+            log_q_prop = log_target_fn(x_prop)                 # (B,)
+            log_alpha = (log_q_prop - log_q).clamp(max=0.0)
+
+        # ── Accept / reject ──────────────────────────────────────────────
         u = torch.rand(B, device=device, dtype=dtype, generator=gen)
-        accept = u < log_alpha.exp()                        # (B,) bool
+        accept = u < log_alpha.exp()                            # (B,)
 
         x     = torch.where(accept.unsqueeze(-1), x_prop, x)
         log_q = torch.where(accept, log_q_prop, log_q)
+        if use_mala:
+            grad_x = torch.where(accept.unsqueeze(-1), grad_prop, grad_x)
 
         accepted_total += accept.float().mean().item()
 

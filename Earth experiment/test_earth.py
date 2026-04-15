@@ -1240,6 +1240,7 @@ def cosine_similarity_vs_steps_two_point(
     batch_eval_size: int = 8,
     include_baseline: bool = True,
     mcmc_tau: float = 0.1,
+    mcmc_use_mala: bool = False,
     mcmc_n_burnin: int = 500,
     device="mps",
     dtype=torch.float32,
@@ -1280,14 +1281,15 @@ def cosine_similarity_vs_steps_two_point(
     batch_eval_size : how many triples to batch into one DPnP call
     include_baseline : bool (default True)
                     If True, also sample from the likelihood-only posterior
-                    q(x) ∝ p(u1|x,y1) p(u2|x,y2) using geodesic random-walk
-                    Metropolis on S² and overlay results as horizontal dashed
-                    lines on the quality-vs-step plot.
+                    q(x) ∝ p(u1|x,y1) p(u2|x,y2) using MCMC on S² and
+                    overlay results as horizontal dashed lines on the
+                    quality-vs-step plot.
                     Note: DPnP with p_score≡0 does NOT achieve this — the
                     BEL bridge p(x0|xt) ∝ p(xt|x0) p0(x0) implicitly uses
                     the earthquake prior, so the baseline must be independent
                     of the learned score model.
-    mcmc_tau        : geodesic step size for MCMC baseline (default 0.1).
+    mcmc_tau        : step size for MCMC baseline (default 0.1).
+    mcmc_use_mala   : bool (default False). If True, use manifold MALA.
     mcmc_n_burnin   : burn-in steps for MCMC (default 500).
     seed          : random seed
 
@@ -1387,12 +1389,15 @@ def cosine_similarity_vs_steps_two_point(
                 y2_b if kappa_sensors is not None else y2.unsqueeze(0).expand(B, 3),
                 u1_batch, u2_batch, beta, sigma2,
             )
+            x_init_bl = y1_b if kappa_sensors is not None else y1.unsqueeze(0).expand(B, 3)
             X_mcmc_bl, _ = mcmc_mh_s2_batched(
                 log_target_fn=log_tgt,
                 B=B,
                 n_samples=out_samples,
                 tau=mcmc_tau,
                 n_burnin=mcmc_n_burnin,
+                x_init=x_init_bl,
+                use_mala=mcmc_use_mala,
                 device=device,
                 dtype=dtype,
                 seed=running_seed + 1,
@@ -1536,6 +1541,7 @@ def run_two_point_earthquake_demo(
     plot_quality_vs_steps: bool = True,
     include_baseline: bool = True,
     mcmc_tau: float = 0.1,
+    mcmc_use_mala: bool = False,
     mcmc_n_burnin: int = 500,
     device="mps",
     dtype=torch.float32,
@@ -1589,13 +1595,17 @@ def run_two_point_earthquake_demo(
     include_baseline    : bool (default True)
                           If True, also draw samples from the likelihood-only
                           posterior q(x) ∝ p(u1|x,y1) p(u2|x,y2) using
-                          geodesic random-walk Metropolis on S² (no score
-                          network), and overlay results on all plots.
+                          MCMC on S² (no score network), and overlay results
+                          on all plots.
                           Note: DPnP with p_score≡0 does NOT achieve this —
                           BEL bridge paths use p(x0|xt)∝p(xt|x0)p0(x0),
                           embedding the earthquake prior regardless of p_score.
     mcmc_tau            : float (default 0.1)
-                          Geodesic step size for the MCMC baseline.
+                          Step size for the MCMC baseline (τ for random walk,
+                          η for MALA).
+    mcmc_use_mala       : bool (default False)
+                          If True, use manifold MALA (gradient-guided proposals)
+                          instead of geodesic random walk.
     mcmc_n_burnin       : int (default 500)
                           Burn-in steps for the MCMC baseline.
     seed                : base random seed
@@ -1762,7 +1772,8 @@ def run_two_point_earthquake_demo(
     score_steps_by_N_bl = {}
 
     if include_baseline:
-        print("\nRunning likelihood-only baseline (MCMC on S²)…")
+        mala_str = "MALA" if mcmc_use_mala else "geodesic RW"
+        print(f"\nRunning likelihood-only baseline ({mala_str} on S²)…")
         log_target = get_two_point_seismic_log_target(
             y1_flat, y2_flat, u1_flat, u2_flat, beta, sigma2
         )
@@ -1772,6 +1783,8 @@ def run_two_point_earthquake_demo(
             n_samples=P,
             tau=mcmc_tau,
             n_burnin=mcmc_n_burnin,
+            x_init=y1_flat,
+            use_mala=mcmc_use_mala,
             device=device,
             dtype=dtype,
             seed=seed + 1,
