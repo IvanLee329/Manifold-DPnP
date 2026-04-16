@@ -1205,10 +1205,11 @@ def _ess_from_chain(chain_1d: np.ndarray) -> float:
 
 @torch.no_grad()
 def tune_mala_tau(
-    x_true,
+    dataloader,
     beta: float = 10.0,
     sigma2: float = 0.05,
-    n_chains: int = 32,
+    num_xtrue: int = 16,
+    n_chains_per_xtrue: int = 4,
     tau_values=None,
     n_samples: int = 1000,
     n_burnin: int = 500,
@@ -1218,38 +1219,43 @@ def tune_mala_tau(
     dtype=torch.float32,
 ):
     """
-    Sweep MCMC step-size τ in the uniform-sensor setting and report the
-    acceptance rate, per-chain ESS (effective sample size), and mean
-    geodesic distance from the chain mean to x_true for each τ.
+    Sweep MCMC step-size τ in the uniform-sensor setting, averaging all
+    diagnostics over multiple x_true sampled from the dataset.
 
-    Uniform sensors: y1, y2 ~ Uniform(S²).  MCMC initialised from Uniform(S²).
+    For each τ, runs  B = num_xtrue × n_chains_per_xtrue  parallel chains
+    simultaneously.  Each group of n_chains_per_xtrue chains shares the same
+    x_true but has independently drawn uniform-random sensors and observations.
 
-    Three diagnostics are plotted and returned:
+    Uniform sensors: y1_b, y2_b ~ Uniform(S²).
+    MCMC init: Uniform(S²) for all chains.
+
+    Three diagnostics (averaged over all B chains / all x_true):
 
     acceptance rate
         Target ~0.574 for MALA (Optimal Scaling theory, d→∞).
-        For this 2-D manifold the sweet spot is usually 0.45–0.65.
 
     ESS per chain
-        Higher → better mixing.  Computed via FFT autocorrelation of the
-        dot product ⟨x_t, x_true⟩ (the most informative 1-D projection).
+        Computed via FFT autocorrelation of ⟨x_t, x_true_i⟩, the projection
+        onto each chain's own x_true.  Averaged over all B chains.
 
     geodesic distance to x_true
-        Mean great-circle distance from the per-chain posterior mean to
-        x_true.  Lower is better; gives a direct measure of bias / mixing.
+        Mean great-circle distance from the per-chain posterior mean to the
+        corresponding x_true.  Lower → better reconstruction.
 
     Parameters
     ----------
-    x_true      : (3,) tensor or array
-    beta        : seismic signal decay rate
-    sigma2      : observation noise variance
-    n_chains    : number of parallel MCMC chains (= sensor instances)
-    tau_values  : 1-D array of τ values to test (default: 20 log-spaced
-                  from 0.05 to 5.0)
-    n_samples   : samples per chain after burn-in
-    n_burnin    : burn-in steps discarded
-    use_mala    : True → manifold MALA; False → geodesic random-walk
-    seed        : random seed
+    dataloader          : DataLoader — source of x_true samples
+    beta                : seismic signal decay rate
+    sigma2              : observation noise variance
+    num_xtrue           : number of x_true values to average over
+    n_chains_per_xtrue  : independent MCMC chains per x_true
+                          (total chains B = num_xtrue × n_chains_per_xtrue)
+    tau_values          : 1-D array of τ values (default: 25 log-spaced
+                          in [0.05, 5.0])
+    n_samples           : samples per chain after burn-in
+    n_burnin            : burn-in steps discarded
+    use_mala            : True → manifold MALA; False → geodesic random-walk
+    seed                : random seed
     device, dtype
 
     Returns
@@ -1262,58 +1268,64 @@ def tune_mala_tau(
 
     tau_values = np.asarray(tau_values, dtype=float)
     device     = torch.device(device)
-    x_true     = normalize_torch(
-        torch.as_tensor(x_true, device=device, dtype=dtype))     # (3,)
     sigma      = math.sqrt(sigma2)
+    B          = num_xtrue * n_chains_per_xtrue   # total parallel chains
 
-    # ── Fixed uniform-random sensors + observations ───────────────────────────
+    # ── Sample x_true from the dataset ───────────────────────────────────────
+    x_true_all, _ = sample_xtrue_y_batches_from_dataloader(
+        dataloader=dataloader,
+        sigma_y=1.0,
+        num_pairs=num_xtrue,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+    )   # (num_xtrue, 3)
+
+    # Repeat each x_true n_chains_per_xtrue times → (B, 3)
+    x_true_rep = x_true_all.repeat_interleave(n_chains_per_xtrue, dim=0)  # (B, 3)
+
+    # ── Uniform-random sensors + observations, one per chain ─────────────────
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
-    y1 = normalize_torch(
-        torch.randn(n_chains, 3, device=device, dtype=dtype, generator=gen))
-    y2 = normalize_torch(
-        torch.randn(n_chains, 3, device=device, dtype=dtype, generator=gen))
-    I1 = seismic_signal(x_true.expand(n_chains, 3), y1, beta)
-    I2 = seismic_signal(x_true.expand(n_chains, 3), y2, beta)
-    u1 = I1 + sigma * torch.randn(
-        n_chains, device=device, dtype=dtype, generator=gen)
-    u2 = I2 + sigma * torch.randn(
-        n_chains, device=device, dtype=dtype, generator=gen)
+    y1 = normalize_torch(torch.randn(B, 3, device=device, dtype=dtype, generator=gen))
+    y2 = normalize_torch(torch.randn(B, 3, device=device, dtype=dtype, generator=gen))
+    I1 = seismic_signal(x_true_rep, y1, beta)   # (B,)
+    I2 = seismic_signal(x_true_rep, y2, beta)
+    u1 = I1 + sigma * torch.randn(B, device=device, dtype=dtype, generator=gen)
+    u2 = I2 + sigma * torch.randn(B, device=device, dtype=dtype, generator=gen)
 
     log_target = get_two_point_seismic_log_target(y1, y2, u1, u2, beta, sigma2)
 
     alg_str = "MALA" if use_mala else "geodesic RW"
-    print(f"Tuning {alg_str} τ  |  {n_chains} chains  "
-          f"|  {n_burnin} burn-in  +  {n_samples} samples each")
+    print(f"Tuning {alg_str} τ  |  {num_xtrue} x_true × {n_chains_per_xtrue} chains = {B} total  "
+          f"|  {n_burnin} burn-in + {n_samples} samples")
     print(f"{'τ':>8}  {'accept':>7}  {'ESS':>8}  {'geo_dist':>9}")
-    print("-" * 40)
+    print("-" * 42)
 
     accept_rates, ess_vals, geo_dists = [], [], []
 
     for tau in tau_values:
         samples, accept_rate = mcmc_mh_s2_batched(
             log_target_fn=log_target,
-            B=n_chains,
+            B=B,
             n_samples=n_samples,
             tau=float(tau),
             n_burnin=n_burnin,
-            x_init=None,          # uniform init (matches uniform-sensor setting)
+            x_init=None,       # uniform init
             use_mala=use_mala,
             device=device,
             dtype=dtype,
             seed=seed + 1,
-        )   # (n_samples, n_chains, 3)
+        )   # (n_samples, B, 3)
 
-        # ── ESS: project each chain onto ⟨·, x_true⟩ ────────────────────────
-        proj = (samples * x_true).sum(-1).cpu().numpy()   # (n_samples, n_chains)
-        ess  = float(np.mean([_ess_from_chain(proj[:, b])
-                               for b in range(n_chains)]))
+        # ── ESS: project each chain onto its own x_true ───────────────────────
+        # samples[:, b, :] · x_true_rep[b]
+        proj = (samples * x_true_rep[None]).sum(-1).cpu().numpy()  # (n_samples, B)
+        ess  = float(np.mean([_ess_from_chain(proj[:, b]) for b in range(B)]))
 
-        # ── Reconstruction quality: mean geodesic distance ────────────────────
-        chain_mean = sphere_mean_torch(samples, dim=0)       # (n_chains, 3)
-        geo = sphere_distance_torch(
-            chain_mean, x_true.expand(n_chains, 3)
-        ).mean().item()
+        # ── Reconstruction quality ────────────────────────────────────────────
+        chain_mean = sphere_mean_torch(samples, dim=0)   # (B, 3)
+        geo = sphere_distance_torch(chain_mean, x_true_rep).mean().item()
 
         accept_rates.append(accept_rate)
         ess_vals.append(ess)
@@ -1326,10 +1338,8 @@ def tune_mala_tau(
 
     best_tau_ess = float(tau_values[np.nanargmax(ess_vals)])
     best_tau_geo = float(tau_values[np.nanargmin(geo_dists)])
-    print(f"\nBest τ by ESS:      {best_tau_ess:.4f}  "
-          f"(ESS={ess_vals.max():.1f})")
-    print(f"Best τ by geo_dist: {best_tau_geo:.4f}  "
-          f"(geo_dist={geo_dists.min():.4f} rad)")
+    print(f"\nBest τ by ESS:      {best_tau_ess:.4f}  (ESS={np.nanmax(ess_vals):.1f})")
+    print(f"Best τ by geo_dist: {best_tau_geo:.4f}  (geo_dist={np.nanmin(geo_dists):.4f} rad)")
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
@@ -1368,17 +1378,17 @@ def tune_mala_tau(
 
     fig.suptitle(
         f"MCMC τ sweep ({alg_str}, uniform sensors, "
-        f"{n_chains} chains × {n_samples} samples)",
+        f"{num_xtrue} x_true × {n_chains_per_xtrue} chains × {n_samples} samples)",
         fontsize=12,
     )
     plt.tight_layout()
     plt.show()
 
     return {
-        "tau":         tau_values,
-        "accept_rate": accept_rates,
-        "ess":         ess_vals,
-        "geo_dist":    geo_dists,
+        "tau":          tau_values,
+        "accept_rate":  accept_rates,
+        "ess":          ess_vals,
+        "geo_dist":     geo_dists,
         "best_tau_ess": best_tau_ess,
         "best_tau_geo": best_tau_geo,
     }
