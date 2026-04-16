@@ -1181,14 +1181,19 @@ def _ess_from_chain(chain_1d: np.ndarray) -> float:
     Effective Sample Size via the initial positive-sequence estimator.
 
     Uses FFT autocorrelation on a 1-D chain.  Returns ESS ∈ (0, N].
+    Returns 1.0 when the chain never moved (zero variance — happens when
+    the acceptance rate is 0 and all samples are identical).
     Reference: Geyer (1992) 'Practical Markov Chain Monte Carlo'.
     """
-    n    = len(chain_1d)
-    x    = chain_1d - chain_1d.mean()
+    n   = len(chain_1d)
+    x   = chain_1d - chain_1d.mean()
+    var = float(np.var(x))
+    if var < 1e-14:
+        return 1.0          # chain stuck — ESS = 1 (worst possible mixing)
     # FFT-based circular autocorrelation, then truncate to length n
-    f    = np.fft.fft(x, n=2 * n)
-    acf  = np.fft.ifft(f * np.conj(f)).real[:n]
-    acf /= acf[0]                    # normalise: acf[0] = 1
+    f   = np.fft.fft(x, n=2 * n)
+    acf = np.fft.ifft(f * np.conj(f)).real[:n]
+    acf /= acf[0]           # normalise: acf[0] = 1  (safe: var > 0 ⟹ acf[0] > 0)
     # Initial positive-sequence truncation (Geyer)
     rho_sum = 1.0
     for k in range(1, n):
@@ -1319,8 +1324,8 @@ def tune_mala_tau(
     ess_vals     = np.array(ess_vals)
     geo_dists    = np.array(geo_dists)
 
-    best_tau_ess = float(tau_values[np.argmax(ess_vals)])
-    best_tau_geo = float(tau_values[np.argmin(geo_dists)])
+    best_tau_ess = float(tau_values[np.nanargmax(ess_vals)])
+    best_tau_geo = float(tau_values[np.nanargmin(geo_dists)])
     print(f"\nBest τ by ESS:      {best_tau_ess:.4f}  "
           f"(ESS={ess_vals.max():.1f})")
     print(f"Best τ by geo_dist: {best_tau_geo:.4f}  "
