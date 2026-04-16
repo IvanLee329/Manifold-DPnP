@@ -4,6 +4,7 @@ import math
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib import cm
+from matplotlib.ticker import MaxNLocator
 
 try:
     from scipy.stats import gaussian_kde
@@ -225,6 +226,7 @@ def cosine_similarity_vs_steps_for_particle_counts(
             )
 
     plt.xlabel("DPnP step")
+    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
     plt.ylabel(ylabel)
     plt.title(plot_title)
     plt.ylim(ymin_cos, ymax_cos)
@@ -1520,6 +1522,7 @@ def cosine_similarity_vs_steps_two_point(
                             alpha=0.06, color=col)
 
     plt.xlabel("DPnP step")
+    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
     plt.ylabel(f"{ylabel}  ({better})")
     plt.title(
         f"Two-point seismic: {ylabel} vs DPnP step\n"
@@ -2308,6 +2311,7 @@ def run_two_point_earthquake_demo(
                                 alpha=0.06, color=col)
 
         plt.xlabel("DPnP step")
+        plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
         plt.ylabel(f"mean {ylabel}  {better}")
         plt.title(
             f"Two-point seismic: {ylabel} vs DPnP step\n"
