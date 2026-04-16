@@ -1307,8 +1307,13 @@ def cosine_similarity_vs_steps_two_point(
         "by_particle_count": {N: {"mean_score", "stderr_score"}},
         "baseline_by_particle_count": {N: {"mean_score", "stderr_score"}}   # if include_baseline
     """
-    if kappa_sensors is None and (y1 is None or y2 is None):
-        raise ValueError("Provide y1 and y2, or set kappa_sensors to sample them per x_true.")
+    _uniform_sensors = (kappa_sensors is None and kent_beta is None
+                        and y1 is None and y2 is None)
+    if not _uniform_sensors and kappa_sensors is None and (y1 is None or y2 is None):
+        raise ValueError(
+            "Provide y1/y2, set kappa_sensors, or leave all sensor args None "
+            "for uniform random sensors."
+        )
     if metric not in {"cosine", "geodesic"}:
         raise ValueError("metric must be 'cosine' or 'geodesic'")
 
@@ -1363,6 +1368,10 @@ def cosine_similarity_vs_steps_two_point(
                 # Sample y1_b, y2_b per x_true ~ vMF(x_true, kappa_sensors)
                 y1_b = sample_vmf_s2(mu=x_batch, kappa=kappa_sensors, generator=gen)  # (B, 3)
                 y2_b = sample_vmf_s2(mu=x_batch, kappa=kappa_sensors, generator=gen)  # (B, 3)
+        elif _uniform_sensors:
+            # Uniform random on S²
+            y1_b = normalize_torch(torch.randn(B, 3, device=device, dtype=dtype, generator=gen))
+            y2_b = normalize_torch(torch.randn(B, 3, device=device, dtype=dtype, generator=gen))
         else:
             y1_b = y1   # (3,) broadcast for all items in batch
             y2_b = y2
@@ -1380,7 +1389,8 @@ def cosine_similarity_vs_steps_two_point(
                              device=device, dtype=dtype)
 
         # Dummy y sets B; use y1_b (per-item) or broadcast y1
-        dummy_y = y1_b if kappa_sensors is not None else y1.unsqueeze(0).expand(B, 3)
+        dummy_y = (y1_b if (kappa_sensors is not None or _uniform_sensors)
+                   else y1.unsqueeze(0).expand(B, 3))
 
         X_steps = dPnP_sampler_torch_batched(
             q_score=q_score_fn,
@@ -1401,11 +1411,13 @@ def cosine_similarity_vs_steps_two_point(
             # equivalent: BEL bridge paths use p(x0|xt)∝p(xt|x0)p0(x0), which
             # encodes the earthquake prior p0 regardless of what p_score returns.
             log_tgt = get_two_point_seismic_log_target(
-                y1_b if kappa_sensors is not None else y1.unsqueeze(0).expand(B, 3),
-                y2_b if kappa_sensors is not None else y2.unsqueeze(0).expand(B, 3),
+                y1_b if (kappa_sensors is not None or _uniform_sensors) else y1.unsqueeze(0).expand(B, 3),
+                y2_b if (kappa_sensors is not None or _uniform_sensors) else y2.unsqueeze(0).expand(B, 3),
                 u1_batch, u2_batch, beta, sigma2,
             )
-            x_init_bl = y1_b if kappa_sensors is not None else y1.unsqueeze(0).expand(B, 3)
+            x_init_bl = (None if _uniform_sensors
+                         else y1_b if kappa_sensors is not None
+                         else y1.unsqueeze(0).expand(B, 3))
             X_mcmc_bl, _ = mcmc_mh_s2_batched(
                 log_target_fn=log_tgt,
                 B=B,
@@ -1470,8 +1482,16 @@ def cosine_similarity_vs_steps_two_point(
             print(f"  N = {N:>3d} | mean {metric} = {mean_score_by_N_bl[N]:.4f}")
 
     # ---- plot ----
-    sensor_desc = (f"vMF sensors kappa={kappa_sensors}" if kappa_sensors is not None
-                   else "fixed sensors")
+
+    if _uniform_sensors:
+        sensor_desc = "uniform random sensors"
+    elif kappa_sensors is None:
+        sensor_desc = "fixed sensors"
+    elif kent_beta is not None:
+        sensor_desc = f"Kent sensors kappa={kappa_sensors}, beta={kent_beta}"
+    else:
+        sensor_desc = f"vMF sensors kappa={kappa_sensors}"
+
     bl_flat = [mean_score_by_N_bl[N] for N in particle_counts] if include_baseline else []
     all_flat = [float(x) for arr in mean_score_by_N.values() for x in arr] + bl_flat
     ymin = min(all_flat)
@@ -1555,6 +1575,7 @@ def run_two_point_earthquake_demo(
     kde_kappa: float = 25.0,
     plot_per_sensor: bool = True,
     plot_global: bool = True,
+    plot_combined: bool = False,
     plot_quality_vs_steps: bool = True,
     plot_3d: bool = False,
     show_kde: bool = True,
@@ -1665,8 +1686,13 @@ def run_two_point_earthquake_demo(
     """
     if p_score is None or eta is None:
         raise ValueError("p_score and eta are required.")
-    if kappa_sensors is None and (y1 is None or y2 is None):
-        raise ValueError("Provide y1/y2, or set kappa_sensors to sample them from vMF.")
+    _uniform_sensors = (kappa_sensors is None and kent_beta is None
+                        and y1 is None and y2 is None)
+    if not _uniform_sensors and kappa_sensors is None and (y1 is None or y2 is None):
+        raise ValueError(
+            "Provide y1/y2, set kappa_sensors, or leave all sensor args None "
+            "for uniform random sensors."
+        )
     if metric not in {"cosine", "geodesic"}:
         raise ValueError("metric must be 'cosine' or 'geodesic'")
 
@@ -1706,6 +1732,14 @@ def run_two_point_earthquake_demo(
                                        n_samples=S, generator=gen)   # (S, 3)
             sensor_desc = f"vMF sensors (kappa={kappa_sensors})"
             print(f"Sampled {S} sensor pairs from vMF(x_true, kappa={kappa_sensors})")
+    elif _uniform_sensors:
+        # Sample S sensor pairs uniformly on S²
+        y1_sensors = normalize_torch(
+            torch.randn(S, 3, device=device, dtype=dtype, generator=gen))
+        y2_sensors = normalize_torch(
+            torch.randn(S, 3, device=device, dtype=dtype, generator=gen))
+        sensor_desc = "uniform random sensors"
+        print(f"Sampled {S} sensor pairs uniformly on S²")
     else:
         y1_t = normalize_torch(torch.as_tensor(y1, device=device, dtype=dtype))
         y2_t = normalize_torch(torch.as_tensor(y2, device=device, dtype=dtype))
@@ -1822,7 +1856,7 @@ def run_two_point_earthquake_demo(
             n_samples=P,
             tau=mcmc_tau,
             n_burnin=mcmc_n_burnin,
-            x_init=y1_flat,
+            x_init=None if _uniform_sensors else y1_flat,
             use_mala=mcmc_use_mala,
             device=device,
             dtype=dtype,
@@ -1891,67 +1925,140 @@ def run_two_point_earthquake_demo(
         plt.show()
         return fig, ax
 
-    def _sphere_3d_ax(samples_3d, title_str, *, extra_markers=None):
-        """Draw samples on a 3D sphere with optional KDE surface coloring."""
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    def _sphere_plotly_ax(samples_3d, title_str, *, extra_markers=None):
+        """Rotatable Plotly 3D sphere — KDE surface when show_kde=True, wireframe otherwise."""
+        import plotly.graph_objects as go
+        import matplotlib.colors as mcolors
 
         samp = normalize_torch(samples_3d.detach().cpu())
-        samp_np = samp.numpy()
 
-        fig = plt.figure(figsize=(8, 7))
-        ax = fig.add_subplot(111, projection="3d")
-
-        # Build sphere mesh for surface / wireframe
-        u_ang = np.linspace(0, 2 * np.pi, 120)
-        v_ang = np.linspace(0,     np.pi,  60)
+        u_ang = np.linspace(0, 2 * np.pi, 80)
+        v_ang = np.linspace(0,     np.pi, 40)
         Ug, Vg = np.meshgrid(u_ang, v_ang)
         Xs = np.sin(Vg) * np.cos(Ug)
         Ys = np.sin(Vg) * np.sin(Ug)
         Zs = np.cos(Vg)
 
+        fig = go.Figure()
+
         if show_kde:
             grid_np = np.stack([Xs, Ys, Zs], axis=-1).reshape(-1, 3)
             grid_t  = torch.tensor(grid_np, dtype=dtype).cpu()
-            dens = spherical_kde_vmf(samp, grid_t, kappa=kde_kappa, normalize=True)
+            dens    = spherical_kde_vmf(samp, grid_t, kappa=kde_kappa, normalize=True)
             dens_np = dens.numpy().reshape(Vg.shape)
-            norm = plt.Normalize(dens_np.min(), dens_np.max())
-            facecolors = plt.cm.viridis(norm(dens_np))
-            ax.plot_surface(Xs, Ys, Zs, facecolors=facecolors,
-                            alpha=0.65, linewidth=0, antialiased=True)
+            fig.add_trace(go.Surface(
+                x=Xs, y=Ys, z=Zs,
+                surfacecolor=dens_np,
+                colorscale="Viridis",
+                opacity=0.85,
+                showscale=True,
+                colorbar=dict(title="KDE", thickness=15, len=0.65),
+                name="KDE",
+                showlegend=False,
+            ))
         else:
-            # Visible wireframe so the sphere shape reads clearly
-            ax.plot_wireframe(Xs, Ys, Zs, color="steelblue",
-                              alpha=0.55, linewidth=0.6,
-                              rstride=4, cstride=4)
+            # Translucent sphere + lat/lon grid lines for a clear wireframe look
+            fig.add_trace(go.Surface(
+                x=Xs, y=Ys, z=Zs,
+                surfacecolor=np.zeros_like(Xs),
+                colorscale=[[0, "rgba(100,149,237,0.18)"],
+                            [1, "rgba(100,149,237,0.18)"]],
+                opacity=0.18,
+                showscale=False,
+                showlegend=False,
+            ))
+            for v in np.linspace(0, np.pi, 10)[1:-1]:      # latitude circles
+                lx = np.sin(v) * np.cos(u_ang)
+                ly = np.sin(v) * np.sin(u_ang)
+                lz = np.full_like(u_ang, np.cos(v))
+                fig.add_trace(go.Scatter3d(
+                    x=lx, y=ly, z=lz, mode="lines",
+                    line=dict(color="steelblue", width=1.5),
+                    showlegend=False, hoverinfo="skip",
+                ))
+            for u in np.linspace(0, 2 * np.pi, 13)[:-1]:  # longitude lines
+                lx = np.sin(v_ang) * np.cos(u)
+                ly = np.sin(v_ang) * np.sin(u)
+                lz = np.cos(v_ang)
+                fig.add_trace(go.Scatter3d(
+                    x=lx, y=ly, z=lz, mode="lines",
+                    line=dict(color="steelblue", width=1.5),
+                    showlegend=False, hoverinfo="skip",
+                ))
+
+        def _c(color, alpha=1.0):
+            try:
+                r, g, b, a = mcolors.to_rgba(color, alpha=alpha)
+                return f"rgba({int(r*255)},{int(g*255)},{int(b*255)},{a:.3f})"
+            except Exception:
+                return "blue"
+
+        _sym = {None: "circle", "o": "circle", ".": "circle",
+                "*": "star", "D": "diamond", "d": "diamond-open",
+                "X": "x", "x": "x", "s": "square",
+                "^": "triangle-up", "v": "triangle-down"}
 
         # x_true
         xt_np = x_true.cpu().numpy()
-        ax.scatter([xt_np[0]], [xt_np[1]], [xt_np[2]],
-                   s=120, color="tab:red", edgecolors="black",
-                   linewidths=1.2, zorder=10, depthshade=False,
-                   label=r"$x_{\rm true}$")
+        fig.add_trace(go.Scatter3d(
+            x=[xt_np[0]], y=[xt_np[1]], z=[xt_np[2]],
+            mode="markers",
+            marker=dict(size=12, color="red",
+                        line=dict(color="black", width=2)),
+            name="x_true",
+        ))
 
         if extra_markers:
             for pts, kwargs in extra_markers:
                 pts_np = normalize_torch(pts.detach().cpu()).numpy()
                 if pts_np.ndim == 1:
                     pts_np = pts_np[None]
-                kw3d = {k: v for k, v in kwargs.items()
-                        if k not in ("edgecolors", "linewidths")}
-                kw3d.setdefault("depthshade", False)
-                ax.scatter(pts_np[:, 0], pts_np[:, 1], pts_np[:, 2], **kw3d)
+                s_mpl   = kwargs.get("s", 20)
+                color   = kwargs.get("color", "blue")
+                alpha   = kwargs.get("alpha", 1.0)
+                ec      = kwargs.get("edgecolors", "none")
+                lw      = kwargs.get("linewidths", 0)
+                sym_mpl = kwargs.get("marker", "o")
+                label   = kwargs.get("label", None)
 
-        ax.set_title(title_str, pad=12)
-        ax.legend(loc="upper right", fontsize=7)
-        ax.set_box_aspect([1, 1, 1])
-        plt.tight_layout()
-        plt.show()
-        return fig, ax
+                c_str  = _c(color, alpha)
+                sym    = _sym.get(sym_mpl, "circle")
+                psize  = max(4, int(np.sqrt(s_mpl) * 1.2))
+                if ec not in (None, "none", "face"):
+                    line_kw = dict(color=_c(ec), width=max(1, int(lw * 1.5)))
+                else:
+                    line_kw = dict(width=0)
+
+                fig.add_trace(go.Scatter3d(
+                    x=pts_np[:, 0], y=pts_np[:, 1], z=pts_np[:, 2],
+                    mode="markers",
+                    marker=dict(size=psize, color=c_str, symbol=sym, line=line_kw),
+                    name=label or "",
+                    showlegend=label is not None,
+                ))
+
+        fig.update_layout(
+            title=dict(text=title_str, font=dict(size=13)),
+            scene=dict(
+                xaxis=dict(showticklabels=False, title="",
+                           showgrid=False, zeroline=False),
+                yaxis=dict(showticklabels=False, title="",
+                           showgrid=False, zeroline=False),
+                zaxis=dict(showticklabels=False, title="",
+                           showgrid=False, zeroline=False),
+                aspectmode="cube",
+            ),
+            legend=dict(x=0.01, y=0.99, font=dict(size=9)),
+            width=720, height=680,
+            margin=dict(l=0, r=0, t=50, b=0),
+        )
+        fig.show()
+        return fig
 
     def _plot_ax(samples_3d, title_str, *, extra_markers=None):
-        """Dispatch to 3D or Mollweide plot depending on plot_3d flag."""
+        """Dispatch to 3D (Plotly) or Mollweide plot depending on plot_3d flag."""
         if plot_3d:
-            return _sphere_3d_ax(samples_3d, title_str, extra_markers=extra_markers)
+            return _sphere_plotly_ax(samples_3d, title_str, extra_markers=extra_markers)
         else:
             return _mollweide_ax(samples_3d, title_str, extra_markers=extra_markers)
 
@@ -1968,7 +2075,7 @@ def run_two_point_earthquake_demo(
             y2s = y2_sensors[s].cpu()
             xr_s = x_reflected[s].cpu()                # reflection (3,)
 
-            dpnp_trial_color = "white" if show_kde else "tab:cyan"
+            dpnp_trial_color = "white" if show_kde else "gold"
             extra = [
                 # per-trial mean markers (DPnP)
                 (trial_means_s,
@@ -2069,6 +2176,86 @@ def run_two_point_earthquake_demo(
                 f"global {ylabel}={score_global:.4f} {better}"
             ),
             extra_markers=extra_global,
+        )
+
+    # ── 9b. Combined plot ─────────────────────────────────────────────────────
+    # Single plot: all sensor pairs + global aggregate + baseline + sensors + reflections
+    if plot_combined:
+        all_particles_c = X_finals.reshape(S * T * P, 3).cpu()
+        extra_c = []
+
+        for s in range(S):
+            col = sensor_colors[s % len(sensor_colors)]
+            sl  = f"s={s + 1}"
+            # Per-sensor trial means (small, sensor-coloured)
+            extra_c.append((
+                trial_means[s].cpu(),
+                dict(s=18, color=col, alpha=0.6, edgecolors="none",
+                     zorder=6, label=f"DPnP trials {sl}" if s < 5 else None),
+            ))
+            # Per-sensor reconstruction mean (medium circle)
+            extra_c.append((
+                sensor_means[s].cpu()[None],
+                dict(s=110, color=col, marker="o", edgecolors="black",
+                     linewidths=1.2, zorder=8, alpha=0.9,
+                     label=f"DPnP mean {sl}" if s < 5 else None),
+            ))
+            # Sensor locations y1, y2 (diamonds / triangles)
+            extra_c.append((
+                y1_sensors[s].cpu()[None],
+                dict(s=65, color=col, marker="D", edgecolors="black",
+                     linewidths=0.8, zorder=7, alpha=0.85,
+                     label=r"$y_1$" if s == 0 else None),
+            ))
+            extra_c.append((
+                y2_sensors[s].cpu()[None],
+                dict(s=65, color=col, marker="^", edgecolors="black",
+                     linewidths=0.8, zorder=7, alpha=0.85,
+                     label=r"$y_2$" if s == 0 else None),
+            ))
+            # Reflection point
+            extra_c.append((
+                x_reflected[s].cpu()[None],
+                dict(s=85, color="tab:purple", marker="X", edgecolors="black",
+                     linewidths=0.9, zorder=9, alpha=0.75,
+                     label=r"$x'$ reflections" if s == 0 else None),
+            ))
+        # Global DPnP mean
+        extra_c.append((
+            global_mean.cpu()[None],
+            dict(s=210, color="gold", marker="*", edgecolors="black",
+                 linewidths=1.5, zorder=11, label="DPnP global mean"),
+        ))
+
+        if include_baseline and trial_means_bl is not None:
+            bl_smeans_c = sphere_mean_torch(trial_means_bl.cpu(), dim=1)  # (S, 3)
+            for s in range(S):
+                extra_c.append((
+                    trial_means_bl[s].cpu(),
+                    dict(s=18, color="tab:pink", alpha=0.35, edgecolors="none",
+                         zorder=5, label="baseline trials" if s == 0 else None),
+                ))
+                extra_c.append((
+                    bl_smeans_c[s][None],
+                    dict(s=110, color="tab:pink", marker="o", edgecolors="black",
+                         linewidths=1.0, zorder=8, alpha=0.9,
+                         label=f"baseline mean s={s+1}" if s < 5 else None),
+                ))
+            bl_gmean_c = sphere_mean_torch(bl_smeans_c, dim=0)
+            extra_c.append((
+                bl_gmean_c[None],
+                dict(s=210, color="tab:pink", marker="*", edgecolors="black",
+                     linewidths=1.5, zorder=11, label="baseline global mean"),
+            ))
+
+        bl_info = (f"  baseline={score_global_bl:.4f}" if include_baseline and score_global_bl is not None else "")
+        _plot_ax(
+            all_particles_c,
+            title_str=(
+                f"Combined — {sensor_desc}\n"
+                f"DPnP global {ylabel}={score_global:.4f}{bl_info}  {better}"
+            ),
+            extra_markers=extra_c,
         )
 
     # ── 10. Quality vs DPnP steps ─────────────────────────────────────────────
