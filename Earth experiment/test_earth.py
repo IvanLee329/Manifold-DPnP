@@ -227,6 +227,7 @@ def cosine_similarity_vs_steps_for_particle_counts(
 
     plt.xlabel("DPnP step")
     plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+    plt.xlim(steps[0], steps[-1])
     plt.ylabel(ylabel)
     plt.title(plot_title)
     plt.ylim(ymin_cos, ymax_cos)
@@ -1523,6 +1524,7 @@ def cosine_similarity_vs_steps_two_point(
 
     plt.xlabel("DPnP step")
     plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+    plt.xlim(steps[0], steps[-1])
     plt.ylabel(f"{ylabel}  ({better})")
     plt.title(
         f"Two-point seismic: {ylabel} vs DPnP step\n"
@@ -2327,6 +2329,7 @@ def run_two_point_earthquake_demo(
 
         plt.xlabel("DPnP step")
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+        plt.xlim(steps_arr[0], steps_arr[-1])
         plt.ylabel(f"mean {ylabel}  {better}")
         plt.title(
             f"Two-point seismic: {ylabel} vs DPnP step\n"
