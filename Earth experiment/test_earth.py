@@ -1944,6 +1944,14 @@ def run_two_point_earthquake_demo(
 
         fig = go.Figure()
 
+        # Shading: colour the sphere surface by a simple diffuse lighting model
+        # so the camera-facing hemisphere appears lighter than the back side.
+        # This gives a strong depth cue regardless of KDE mode.
+        _light_dir = np.array([1.0, 1.0, 1.0])
+        _light_dir = _light_dir / np.linalg.norm(_light_dir)
+        _normals   = np.stack([Xs, Ys, Zs], axis=-1)        # unit normals = position on S²
+        _diffuse   = np.clip((_normals * _light_dir).sum(-1), 0, 1)
+
         if show_kde:
             grid_np = np.stack([Xs, Ys, Zs], axis=-1).reshape(-1, 3)
             grid_t  = torch.tensor(grid_np, dtype=dtype).cpu()
@@ -1953,21 +1961,28 @@ def run_two_point_earthquake_demo(
                 x=Xs, y=Ys, z=Zs,
                 surfacecolor=dens_np,
                 colorscale="Viridis",
-                opacity=0.85,
+                opacity=0.92,
                 showscale=True,
                 colorbar=dict(title="KDE", thickness=15, len=0.65),
+                lighting=dict(ambient=0.35, diffuse=0.65, specular=0.15,
+                              roughness=0.5, fresnel=0.1),
+                lightposition=dict(x=1000, y=1000, z=1000),
                 name="KDE",
                 showlegend=False,
             ))
         else:
-            # Translucent sphere + lat/lon grid lines for a clear wireframe look
+            # Shaded opaque sphere so back-side markers are hidden
             fig.add_trace(go.Surface(
                 x=Xs, y=Ys, z=Zs,
-                surfacecolor=np.zeros_like(Xs),
-                colorscale=[[0, "rgba(100,149,237,0.18)"],
-                            [1, "rgba(100,149,237,0.18)"]],
-                opacity=0.18,
+                surfacecolor=_diffuse,
+                colorscale=[[0, "rgba(40,60,90,0.85)"],
+                            [0.5, "rgba(100,149,237,0.70)"],
+                            [1, "rgba(200,220,255,0.55)"]],
+                opacity=0.55,
                 showscale=False,
+                lighting=dict(ambient=0.45, diffuse=0.55, specular=0.1,
+                              roughness=0.6, fresnel=0.05),
+                lightposition=dict(x=1000, y=1000, z=1000),
                 showlegend=False,
             ))
             for v in np.linspace(0, np.pi, 10)[1:-1]:      # latitude circles
