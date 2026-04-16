@@ -1993,10 +1993,12 @@ def run_two_point_earthquake_demo(
             except Exception:
                 return "blue"
 
+        # Plotly 3D only supports: circle, circle-open, cross, diamond,
+        # diamond-open, square, square-open, x
         _sym = {None: "circle", "o": "circle", ".": "circle",
-                "*": "star", "D": "diamond", "d": "diamond-open",
+                "*": "diamond", "D": "diamond", "d": "diamond-open",
                 "X": "x", "x": "x", "s": "square",
-                "^": "triangle-up", "v": "triangle-down"}
+                "^": "circle", "v": "circle"}
 
         # x_true
         xt_np = x_true.cpu().numpy()
